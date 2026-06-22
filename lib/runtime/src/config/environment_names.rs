@@ -578,6 +578,41 @@ pub mod tcp_response_stream {
     /// If unset, the server auto-detects a routable local IP.
     pub const DYN_TCP_RESPONSE_STREAM_HOST: &str = "DYN_TCP_RESPONSE_STREAM_HOST";
 
+    /// TCP request-plane TLS configuration
+    pub mod tls {
+        /// Path to the PEM certificate used by the TCP server.
+        /// When set together with DYN_TCP_TLS_KEY_PATH, TLS is enabled on the
+        /// TCP request-plane (both server-side and client-side).
+        pub const DYN_TCP_TLS_CERT_PATH: &str = "DYN_TCP_TLS_CERT_PATH";
+
+        /// Path to the PEM private key for the TCP server certificate.
+        pub const DYN_TCP_TLS_KEY_PATH: &str = "DYN_TCP_TLS_KEY_PATH";
+
+        /// Path to the PEM CA certificate used by TCP clients to verify the server.
+        /// Required on the client side when the server uses a self-signed or internal CA.
+        pub const DYN_TCP_TLS_CA_CERT_PATH: &str = "DYN_TCP_TLS_CA_CERT_PATH";
+
+        /// Disable TLS certificate verification on the TCP client. Set to "true" to skip.
+        /// WARNING: Only for local development. Never use in production.
+        pub const DYN_TCP_TLS_INSECURE: &str = "DYN_TCP_TLS_INSECURE";
+
+        /// Override the TLS server name (SNI) used by TCP clients when verifying the
+        /// server certificate. When unset, the hostname extracted from the connection
+        /// address is used. Useful when connecting by IP to a server whose certificate
+        /// uses a DNS SAN.
+        pub const DYN_TCP_TLS_SERVER_NAME: &str = "DYN_TCP_TLS_SERVER_NAME";
+
+        /// Path to the PEM client certificate presented by TCP clients to the server.
+        /// Must be set together with DYN_TCP_TLS_CLIENT_KEY_PATH to enable mTLS on the client side.
+        pub const DYN_TCP_TLS_CLIENT_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CERT_PATH";
+
+        /// Path to the PEM private key for the TCP client certificate.
+        pub const DYN_TCP_TLS_CLIENT_KEY_PATH: &str = "DYN_TCP_TLS_CLIENT_KEY_PATH";
+
+        /// Path to the PEM CA certificate used by the TCP server to verify client certificates.
+        /// When set, the server requires clients to present a valid certificate (mTLS).
+        pub const DYN_TCP_TLS_CLIENT_CA_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CA_CERT_PATH";
+    }
 }
 
 /// Event Plane transport environment variables

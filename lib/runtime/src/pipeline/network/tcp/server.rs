@@ -9,8 +9,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use tokio_rustls::TlsAcceptor;
 
 /// Tombstone lifetime. Bridges the `register()` → `associate_instance()`
 /// window (sub-millisecond in practice); 5s bounds the set by recent worker
@@ -226,7 +228,12 @@ impl TcpStreamServer {
 
         let state = Arc::new(Mutex::new(State::default()));
 
-        let local_port = Self::start(local_ip.clone(), options.port, state.clone())
+        // Build TLS acceptor from environment if cert+key paths are configured.
+        let tls_acceptor = Self::build_tls_acceptor().map_err(|e| {
+            PipelineError::Generic(format!("Failed to build TCP TLS acceptor: {}", e))
+        })?;
+
+        let local_port = Self::start(local_ip.clone(), options.port, state.clone(), tls_acceptor)
             .await
             .map_err(|e| {
                 PipelineError::Generic(format!("Failed to start TcpStreamServer: {}", e))
@@ -361,8 +368,46 @@ impl TcpStreamServer {
         state.removed_instances.remove(id);
     }
 
+    /// Build a TLS acceptor from env vars if `DYN_TCP_TLS_CERT_PATH` and
+    /// `DYN_TCP_TLS_KEY_PATH` are set. When `DYN_TCP_TLS_CLIENT_CA_CERT_PATH`
+    /// is also set, the acceptor requires clients to present a valid certificate
+    /// (mutual TLS).
+    fn build_tls_acceptor() -> anyhow::Result<Option<Arc<TlsAcceptor>>> {
+        use crate::config::environment_names::tcp_response_stream::tls as env;
+        let cert_path = std::env::var(env::DYN_TCP_TLS_CERT_PATH).ok();
+        let key_path = std::env::var(env::DYN_TCP_TLS_KEY_PATH).ok();
+        let client_ca = std::env::var(env::DYN_TCP_TLS_CLIENT_CA_CERT_PATH).ok();
+        match (cert_path, key_path) {
+            (Some(cert), Some(key)) => {
+                let server_config = crate::tls_utils::server_tls_config(
+                    cert.as_ref(),
+                    key.as_ref(),
+                    client_ca.as_deref().map(std::path::Path::new),
+                )?;
+                Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(server_config)))))
+            }
+            (None, None) if client_ca.is_some() => anyhow::bail!(
+                "{} requires {} and {} to also be set",
+                env::DYN_TCP_TLS_CLIENT_CA_CERT_PATH,
+                env::DYN_TCP_TLS_CERT_PATH,
+                env::DYN_TCP_TLS_KEY_PATH,
+            ),
+            (None, None) => Ok(None),
+            _ => anyhow::bail!(
+                "Both {} and {} must be set to enable TCP TLS",
+                env::DYN_TCP_TLS_CERT_PATH,
+                env::DYN_TCP_TLS_KEY_PATH
+            ),
+        }
+    }
+
     #[allow(clippy::await_holding_lock)]
-    async fn start(local_ip: String, local_port: u16, state: Arc<Mutex<State>>) -> Result<u16> {
+    async fn start(
+        local_ip: String,
+        local_port: u16,
+        state: Arc<Mutex<State>>,
+        tls_acceptor: Option<Arc<TlsAcceptor>>,
+    ) -> Result<u16> {
         let addr = format!("{}:{}", local_ip, local_port);
         let state_clone = state.clone();
         let mut guard = state.lock().await;
@@ -370,7 +415,7 @@ impl TcpStreamServer {
             panic!("TcpStreamServer already started");
         }
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<u16>>();
-        let handle = tokio::spawn(tcp_listener(addr, state_clone, ready_tx));
+        let handle = tokio::spawn(tcp_listener(addr, state_clone, tls_acceptor, ready_tx));
         guard.handle = Some(handle);
         drop(guard);
         let local_port = ready_rx.await??;
@@ -511,6 +556,10 @@ impl ResponseService for TcpStreamServer {
     }
 }
 
+// Type aliases for boxed split halves used throughout the nested handlers below.
+type BoxRead = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
+type BoxWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
 // this method listens on a tcp port for incoming connections
 // new connections are expected to send a protocol specific handshake
 // for us to determine the subject they are interested in, in this case,
@@ -520,6 +569,7 @@ impl ResponseService for TcpStreamServer {
 async fn tcp_listener(
     addr: String,
     state: Arc<Mutex<State>>,
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
     read_tx: tokio::sync::oneshot::Sender<Result<u16>>,
 ) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -575,13 +625,40 @@ async fn tcp_listener(
             }
         }
 
-        tokio::spawn(handle_connection(stream, state.clone()));
+        // Spawn per-connection so the accept loop is never blocked by a slow
+        // TLS handshake. The handshake is bounded by a 10-second timeout.
+        let state_clone = state.clone();
+        let tls_acceptor_clone = tls_acceptor.clone();
+        tokio::spawn(async move {
+            let (reader, writer) = if let Some(ref tls) = tls_acceptor_clone {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), tls.accept(stream))
+                    .await
+                {
+                    Ok(Ok(tls_stream)) => {
+                        let (r, w) = tokio::io::split(tls_stream);
+                        (Box::new(r) as BoxRead, Box::new(w) as BoxWrite)
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("TLS handshake failed: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("TLS handshake timed out");
+                        return;
+                    }
+                }
+            } else {
+                let (r, w) = tokio::io::split(stream);
+                (Box::new(r) as BoxRead, Box::new(w) as BoxWrite)
+            };
+            handle_connection(reader, writer, state_clone).await;
+        });
     }
 
     // #[instrument(level = "trace"), skip(state)]
     // todo - clone before spawn and trace process_stream
-    async fn handle_connection(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
-        let result = process_stream(stream, state).await;
+    async fn handle_connection(reader: BoxRead, writer: BoxWrite, state: Arc<Mutex<State>>) {
+        let result = process_stream(reader, writer, state).await;
         match result {
             Ok(_) => tracing::trace!("successfully processed tcp connection"),
             Err(e) => {
@@ -594,10 +671,11 @@ async fn tcp_listener(
 
     /// This method is responsible for the internal tcp stream handshake
     /// The handshake will specialize the stream as a request/sender or response/receiver stream
-    async fn process_stream(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) -> Result<()> {
-        // split the socket in to a reader and writer
-        let (read_half, write_half) = tokio::io::split(stream);
-
+    async fn process_stream(
+        read_half: BoxRead,
+        write_half: BoxWrite,
+        state: Arc<Mutex<State>>,
+    ) -> Result<()> {
         // attach the codec to the reader and writer to get framed readers and writers
         let mut framed_reader = FramedRead::new(read_half, TwoPartCodec::default());
         let framed_writer = FramedWrite::new(write_half, TwoPartCodec::default());
@@ -647,8 +725,8 @@ async fn tcp_listener(
     async fn process_request_stream(
         subject: String,
         state: Arc<Mutex<State>>,
-        reader: FramedRead<tokio::io::ReadHalf<tokio::net::TcpStream>, TwoPartCodec>,
-        writer: FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>,
+        reader: FramedRead<BoxRead, TwoPartCodec>,
+        writer: FramedWrite<BoxWrite, TwoPartCodec>,
     ) -> Result<()> {
         // Request stream is unidirectional; we don't read from the downstream.
         drop(reader);
@@ -709,7 +787,7 @@ async fn tcp_listener(
     /// The downstream `handle_request_reader` matches on the received variant
     /// and reacts accordingly.
     async fn request_stream_send_handler(
-        mut framed_writer: FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>,
+        mut framed_writer: FramedWrite<BoxWrite, TwoPartCodec>,
         mut request_rx: mpsc::Receiver<TwoPartMessage>,
         context: Arc<dyn AsyncEngineContext>,
     ) {
@@ -768,8 +846,8 @@ async fn tcp_listener(
     async fn process_response_stream(
         subject: String,
         state: Arc<Mutex<State>>,
-        mut reader: FramedRead<tokio::io::ReadHalf<tokio::net::TcpStream>, TwoPartCodec>,
-        writer: FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>,
+        mut reader: FramedRead<BoxRead, TwoPartCodec>,
+        writer: FramedWrite<BoxWrite, TwoPartCodec>,
     ) -> Result<()> {
         let response_stream = {
             let mut guard = state.lock().await;
@@ -872,7 +950,7 @@ async fn tcp_listener(
     }
 
     async fn network_receive_handler(
-        mut framed_reader: FramedRead<tokio::io::ReadHalf<tokio::net::TcpStream>, TwoPartCodec>,
+        mut framed_reader: FramedRead<BoxRead, TwoPartCodec>,
         response_tx: mpsc::Sender<Bytes>,
         control_tx: mpsc::Sender<ControlMessage>,
         context: Arc<dyn AsyncEngineContext>,
@@ -966,7 +1044,7 @@ async fn tcp_listener(
     }
 
     async fn network_send_handler(
-        socket_tx: FramedWrite<tokio::io::WriteHalf<tokio::net::TcpStream>, TwoPartCodec>,
+        socket_tx: FramedWrite<BoxWrite, TwoPartCodec>,
         control_rx: mpsc::Receiver<ControlMessage>,
     ) {
         let mut socket_tx = socket_tx;
