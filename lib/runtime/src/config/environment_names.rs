@@ -170,6 +170,26 @@ pub mod nats {
         /// Maximum age for messages in NATS stream (in seconds)
         pub const DYN_NATS_STREAM_MAX_AGE: &str = "DYN_NATS_STREAM_MAX_AGE";
     }
+
+    /// NATS TLS configuration
+    pub mod tls {
+        /// Path to the PEM CA certificate used to verify the NATS server's certificate.
+        /// When set, TLS is enabled for the NATS connection and the NATS_SERVER URL
+        /// must use the `tls://` scheme (e.g. `tls://nats:4222`).
+        pub const NATS_TLS_CA_CERT_PATH: &str = "NATS_TLS_CA_CERT_PATH";
+
+        /// Path to the PEM client certificate for mutual TLS (mTLS) with NATS.
+        /// Must be set together with NATS_TLS_CLIENT_KEY_PATH.
+        pub const NATS_TLS_CLIENT_CERT_PATH: &str = "NATS_TLS_CLIENT_CERT_PATH";
+
+        /// Path to the PEM client private key for mutual TLS (mTLS) with NATS.
+        /// Must be set together with NATS_TLS_CLIENT_CERT_PATH.
+        pub const NATS_TLS_CLIENT_KEY_PATH: &str = "NATS_TLS_CLIENT_KEY_PATH";
+
+        /// Disable TLS certificate verification. Set to "true" to skip verification.
+        /// WARNING: Only for local development. Never use in production.
+        pub const NATS_TLS_INSECURE: &str = "NATS_TLS_INSECURE";
+    }
 }
 
 /// ETCD transport environment variables
@@ -557,6 +577,7 @@ pub mod tcp_response_stream {
     /// Host/interface for the TCP response stream server.
     /// If unset, the server auto-detects a routable local IP.
     pub const DYN_TCP_RESPONSE_STREAM_HOST: &str = "DYN_TCP_RESPONSE_STREAM_HOST";
+
 }
 
 /// Event Plane transport environment variables

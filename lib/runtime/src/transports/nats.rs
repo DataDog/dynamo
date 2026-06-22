@@ -16,6 +16,16 @@
 //! - `NATS_AUTH_CREDENTIALS_FILE`: the path to the credentials file
 //!
 //! Note: `NATS_AUTH_USERNAME` and `NATS_AUTH_PASSWORD` must be used together.
+//!
+//! ## TLS
+//!
+//! TLS is enabled when `NATS_TLS_CA_CERT_PATH` is set. The NATS_SERVER URL must
+//! use the `tls://` scheme (e.g. `tls://nats:4222`).
+//!
+//! - `NATS_TLS_CA_CERT_PATH`: path to the CA cert PEM used to verify the server
+//! - `NATS_TLS_CLIENT_CERT_PATH`: client cert PEM for mutual TLS (optional)
+//! - `NATS_TLS_CLIENT_KEY_PATH`: client key PEM for mutual TLS (optional)
+//! - `NATS_TLS_INSECURE`: set to "true" to skip certificate verification (dev only)
 use crate::metrics::MetricsHierarchy;
 use crate::protocols::EndpointId;
 
@@ -280,6 +290,23 @@ pub struct ClientOptions {
 
     #[builder(default)]
     auth: NatsAuth,
+
+    /// Path to PEM CA certificate for TLS. When set, TLS is required and
+    /// `NATS_SERVER` must use the `tls://` scheme.
+    #[builder(default = "default_nats_tls_ca_cert_path()")]
+    tls_ca_cert_path: Option<PathBuf>,
+
+    /// Path to PEM client certificate for mutual TLS (mTLS).
+    #[builder(default = "default_nats_tls_client_cert_path()")]
+    tls_client_cert_path: Option<PathBuf>,
+
+    /// Path to PEM client private key for mutual TLS (mTLS).
+    #[builder(default = "default_nats_tls_client_key_path()")]
+    tls_client_key_path: Option<PathBuf>,
+
+    /// Skip TLS certificate verification. For development only.
+    #[builder(default = "default_nats_tls_insecure()")]
+    tls_insecure: bool,
 }
 
 fn default_server() -> String {
@@ -291,11 +318,38 @@ fn default_server() -> String {
 }
 
 fn validate_nats_server(server: &str) -> Result<(), ValidationError> {
-    if server.starts_with("nats://") {
+    if server.starts_with("nats://") || server.starts_with("tls://") {
         Ok(())
     } else {
-        Err(ValidationError::new("server must start with 'nats://'"))
+        Err(ValidationError::new(
+            "server must start with 'nats://' or 'tls://'",
+        ))
     }
+}
+
+fn default_nats_tls_ca_cert_path() -> Option<PathBuf> {
+    std::env::var(env_nats::tls::NATS_TLS_CA_CERT_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_nats_tls_client_cert_path() -> Option<PathBuf> {
+    std::env::var(env_nats::tls::NATS_TLS_CLIENT_CERT_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_nats_tls_client_key_path() -> Option<PathBuf> {
+    std::env::var(env_nats::tls::NATS_TLS_CLIENT_KEY_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_nats_tls_insecure() -> bool {
+    std::env::var(env_nats::tls::NATS_TLS_INSECURE)
+        .ok()
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
 }
 
 // TODO(jthomson04): We really shouldn't be hardcoding this.
@@ -311,7 +365,7 @@ impl ClientOptions {
     pub async fn connect(self) -> Result<Client> {
         self.validate()?;
 
-        let client = match self.auth {
+        let mut options = match self.auth {
             NatsAuth::UserPass(username, password) => {
                 async_nats::ConnectOptions::with_user_and_password(username, password)
             }
@@ -321,6 +375,30 @@ impl ClientOptions {
                 async_nats::ConnectOptions::with_credentials_file(path).await?
             }
         };
+
+        // Validate that client cert and key are either both set or both unset.
+        if self.tls_client_cert_path.is_some() != self.tls_client_key_path.is_some() {
+            anyhow::bail!(
+                "Both {} and {} must be set together to enable NATS mTLS",
+                crate::config::environment_names::nats::tls::NATS_TLS_CLIENT_CERT_PATH,
+                crate::config::environment_names::nats::tls::NATS_TLS_CLIENT_KEY_PATH,
+            );
+        }
+
+        // Apply TLS when a CA cert path is provided, insecure mode is requested,
+        // or a client cert is set. When both client cert and key are set, mTLS is used.
+        let tls_enabled = self.tls_ca_cert_path.is_some()
+            || self.tls_insecure
+            || self.tls_client_cert_path.is_some();
+        if tls_enabled {
+            let tls_config = crate::tls_utils::client_tls_config(
+                self.tls_ca_cert_path.as_deref(),
+                self.tls_insecure,
+                self.tls_client_cert_path.as_deref(),
+                self.tls_client_key_path.as_deref(),
+            )?;
+            options = options.tls_client_config(tls_config).require_tls(true);
+        }
 
         // 0 is treated as unset — Duration::from_secs(0) would time out every request immediately.
         let request_timeout = std::env::var(env_nats::DYN_NATS_REQUEST_TIMEOUT_SECS)
@@ -335,7 +413,7 @@ impl ClientOptions {
 
         let (client, _) = build_in_runtime(
             async move {
-                client
+                options
                     .connect(self.server)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to connect to NATS: {e}. Verify NATS server is running and accessible."))
@@ -355,6 +433,10 @@ impl Default for ClientOptions {
         ClientOptions {
             server: default_server(),
             auth: NatsAuth::default(),
+            tls_ca_cert_path: default_nats_tls_ca_cert_path(),
+            tls_client_cert_path: default_nats_tls_client_cert_path(),
+            tls_client_key_path: default_nats_tls_client_key_path(),
+            tls_insecure: default_nats_tls_insecure(),
         }
     }
 }
