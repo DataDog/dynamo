@@ -230,6 +230,10 @@ type DRAConfiguration struct {
 type InfrastructureConfiguration struct {
 	// NATSAddress is the address of the NATS server
 	NATSAddress string `json:"natsAddress"`
+	// NATSTLSCAPath is the path to the CA certificate used to verify the NATS server TLS
+	// certificate. When set, NATS_TLS_CA_CERT_PATH is injected into every DGD pod so clients
+	// can connect to a TLS-enabled NATS server without per-DGD configuration.
+	NATSTLSCAPath string `json:"natsTLSCAPath,omitempty"`
 	// ETCDAddress is the address of the etcd server
 	ETCDAddress string `json:"etcdAddress"`
 	// ModelExpressURL is the URL of the Model Express server to inject into all pods

@@ -1465,6 +1465,13 @@ func AddStandardEnvVars(container *corev1.Container, operatorConfig *configv1alp
 		})
 	}
 
+	if operatorConfig.Infrastructure.NATSTLSCAPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "NATS_TLS_CA_CERT_PATH",
+			Value: operatorConfig.Infrastructure.NATSTLSCAPath,
+		})
+	}
+
 	if operatorConfig.Infrastructure.ETCDAddress != "" {
 		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
 			Name:  "ETCD_ENDPOINTS",
