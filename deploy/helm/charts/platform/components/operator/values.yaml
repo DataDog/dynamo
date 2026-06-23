@@ -146,6 +146,10 @@ metricsService:
   type: ClusterIP
 
 natsAddr: ""
+# natsTLSCAPath: path to the CA certificate used to verify the NATS server TLS
+# certificate. When set, NATS_TLS_CA_CERT_PATH is injected into every DGD pod.
+# Example (emissary filemode): /etc/emissary/certs/server/ca.pem
+natsTLSCAPath: ""
 etcdAddr: ""
 
 modelExpressURL: ""
