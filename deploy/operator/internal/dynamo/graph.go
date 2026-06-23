@@ -1415,17 +1415,41 @@ func AddStandardEnvVars(container *corev1.Container, operatorConfig *configv1alp
 		})
 	}
 
-	for envName, fieldVal := range map[string]string{
-		"DYN_TCP_TLS_CERT_PATH":           operatorConfig.Infrastructure.TCPTLSCertPath,
-		"DYN_TCP_TLS_KEY_PATH":            operatorConfig.Infrastructure.TCPTLSKeyPath,
-		"DYN_TCP_TLS_CA_CERT_PATH":        operatorConfig.Infrastructure.TCPTLSCAPath,
-		"DYN_TCP_TLS_CLIENT_CERT_PATH":    operatorConfig.Infrastructure.TCPTLSClientCertPath,
-		"DYN_TCP_TLS_CLIENT_KEY_PATH":     operatorConfig.Infrastructure.TCPTLSClientKeyPath,
-		"DYN_TCP_TLS_CLIENT_CA_CERT_PATH": operatorConfig.Infrastructure.TCPTLSClientCAPath,
-	} {
-		if fieldVal != "" {
-			standardEnvVars = append(standardEnvVars, corev1.EnvVar{Name: envName, Value: fieldVal})
-		}
+	if operatorConfig.Infrastructure.TCPTLSCertPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "DYN_TCP_TLS_CERT_PATH",
+			Value: operatorConfig.Infrastructure.TCPTLSCertPath,
+		})
+	}
+	if operatorConfig.Infrastructure.TCPTLSKeyPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "DYN_TCP_TLS_KEY_PATH",
+			Value: operatorConfig.Infrastructure.TCPTLSKeyPath,
+		})
+	}
+	if operatorConfig.Infrastructure.TCPTLSCAPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "DYN_TCP_TLS_CA_CERT_PATH",
+			Value: operatorConfig.Infrastructure.TCPTLSCAPath,
+		})
+	}
+	if operatorConfig.Infrastructure.TCPTLSClientCertPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "DYN_TCP_TLS_CLIENT_CERT_PATH",
+			Value: operatorConfig.Infrastructure.TCPTLSClientCertPath,
+		})
+	}
+	if operatorConfig.Infrastructure.TCPTLSClientKeyPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "DYN_TCP_TLS_CLIENT_KEY_PATH",
+			Value: operatorConfig.Infrastructure.TCPTLSClientKeyPath,
+		})
+	}
+	if operatorConfig.Infrastructure.TCPTLSClientCAPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "DYN_TCP_TLS_CLIENT_CA_CERT_PATH",
+			Value: operatorConfig.Infrastructure.TCPTLSClientCAPath,
+		})
 	}
 
 	if operatorConfig.Infrastructure.ETCDAddress != "" {
