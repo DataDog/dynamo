@@ -234,6 +234,18 @@ type InfrastructureConfiguration struct {
 	// certificate. When set, NATS_TLS_CA_CERT_PATH is injected into every DGD pod so clients
 	// can connect to a TLS-enabled NATS server without per-DGD configuration.
 	NATSTLSCAPath string `json:"natsTLSCAPath,omitempty"`
+	// TCPTLSCertPath is injected as DYN_TCP_TLS_CERT_PATH (frontend server cert).
+	TCPTLSCertPath string `json:"tcpTLSCertPath,omitempty"`
+	// TCPTLSKeyPath is injected as DYN_TCP_TLS_KEY_PATH (frontend server key).
+	TCPTLSKeyPath string `json:"tcpTLSKeyPath,omitempty"`
+	// TCPTLSCAPath is injected as DYN_TCP_TLS_CA_CERT_PATH (worker CA to verify frontend cert).
+	TCPTLSCAPath string `json:"tcpTLSCAPath,omitempty"`
+	// TCPTLSClientCertPath is injected as DYN_TCP_TLS_CLIENT_CERT_PATH (worker client cert for mTLS).
+	TCPTLSClientCertPath string `json:"tcpTLSClientCertPath,omitempty"`
+	// TCPTLSClientKeyPath is injected as DYN_TCP_TLS_CLIENT_KEY_PATH (worker client key for mTLS).
+	TCPTLSClientKeyPath string `json:"tcpTLSClientKeyPath,omitempty"`
+	// TCPTLSClientCAPath is injected as DYN_TCP_TLS_CLIENT_CA_CERT_PATH (frontend CA to verify worker client certs, mTLS).
+	TCPTLSClientCAPath string `json:"tcpTLSClientCAPath,omitempty"`
 	// ETCDAddress is the address of the etcd server
 	ETCDAddress string `json:"etcdAddress"`
 	// ModelExpressURL is the URL of the Model Express server to inject into all pods

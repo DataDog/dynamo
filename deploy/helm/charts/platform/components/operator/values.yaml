@@ -146,10 +146,17 @@ metricsService:
   type: ClusterIP
 
 natsAddr: ""
-# natsTLSCAPath: path to the CA certificate used to verify the NATS server TLS
-# certificate. When set, NATS_TLS_CA_CERT_PATH is injected into every DGD pod.
+# natsTLSCAPath: auto-inject NATS_TLS_CA_CERT_PATH into every DGD pod.
 # Example (emissary filemode): /etc/emissary/certs/server/ca.pem
 natsTLSCAPath: ""
+# TCP request-plane TLS — auto-inject DYN_TCP_TLS_* into every DGD pod.
+# Requires a TLS-capable dynamo-vllm-runtime image.
+tcpTLSCertPath: ""
+tcpTLSKeyPath: ""
+tcpTLSCAPath: ""
+tcpTLSClientCertPath: ""
+tcpTLSClientKeyPath: ""
+tcpTLSClientCAPath: ""
 etcdAddr: ""
 
 modelExpressURL: ""

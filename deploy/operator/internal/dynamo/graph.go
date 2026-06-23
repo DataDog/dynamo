@@ -1415,6 +1415,19 @@ func AddStandardEnvVars(container *corev1.Container, operatorConfig *configv1alp
 		})
 	}
 
+	for envName, fieldVal := range map[string]string{
+		"DYN_TCP_TLS_CERT_PATH":           operatorConfig.Infrastructure.TCPTLSCertPath,
+		"DYN_TCP_TLS_KEY_PATH":            operatorConfig.Infrastructure.TCPTLSKeyPath,
+		"DYN_TCP_TLS_CA_CERT_PATH":        operatorConfig.Infrastructure.TCPTLSCAPath,
+		"DYN_TCP_TLS_CLIENT_CERT_PATH":    operatorConfig.Infrastructure.TCPTLSClientCertPath,
+		"DYN_TCP_TLS_CLIENT_KEY_PATH":     operatorConfig.Infrastructure.TCPTLSClientKeyPath,
+		"DYN_TCP_TLS_CLIENT_CA_CERT_PATH": operatorConfig.Infrastructure.TCPTLSClientCAPath,
+	} {
+		if fieldVal != "" {
+			standardEnvVars = append(standardEnvVars, corev1.EnvVar{Name: envName, Value: fieldVal})
+		}
+	}
+
 	if operatorConfig.Infrastructure.ETCDAddress != "" {
 		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
 			Name:  "ETCD_ENDPOINTS",
