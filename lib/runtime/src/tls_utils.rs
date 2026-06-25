@@ -89,6 +89,10 @@ pub fn client_tls_config(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     if insecure {
+        tracing::warn!(
+            "TCP TLS certificate verification is DISABLED — \
+             this must not be used in production"
+        );
         let builder = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .context("configuring TLS protocol versions")?
@@ -129,6 +133,13 @@ pub fn client_tls_config(
             root_store
                 .add(cert)
                 .context("adding CA certificate to root store")?;
+        }
+        if root_store.is_empty() {
+            anyhow::bail!(
+                "CA certificate store is empty after parsing {}; \
+                 ensure the file contains at least one valid PEM certificate",
+                ca_path.display()
+            );
         }
     }
     // When no CA cert is provided, the root store is empty — the caller must
@@ -205,5 +216,83 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn make_cert_files() -> (NamedTempFile, NamedTempFile) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert.pem().as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file
+            .write_all(key_pair.serialize_pem().as_bytes())
+            .unwrap();
+        (cert_file, key_file)
+    }
+
+    #[test]
+    fn server_config_roundtrip() {
+        let (cert, key) = make_cert_files();
+        server_tls_config(cert.path(), key.path(), None).unwrap();
+    }
+
+    #[test]
+    fn server_config_bad_paths() {
+        let missing = std::path::Path::new("/nonexistent/x.pem");
+        assert!(
+            server_tls_config(missing, missing, None)
+                .unwrap_err()
+                .to_string()
+                .contains("reading cert")
+        );
+        let (cert, _) = make_cert_files();
+        assert!(
+            server_tls_config(cert.path(), missing, None)
+                .unwrap_err()
+                .to_string()
+                .contains("reading key")
+        );
+    }
+
+    #[test]
+    fn client_config_insecure() {
+        client_tls_config(None, true, None, None).unwrap();
+    }
+
+    #[test]
+    fn client_config_with_ca() {
+        let (cert, _) = make_cert_files();
+        client_tls_config(Some(cert.path()), false, None, None).unwrap();
+    }
+
+    #[test]
+    fn client_config_empty_ca_errors() {
+        let empty = NamedTempFile::new().unwrap();
+        assert!(
+            client_tls_config(Some(empty.path()), false, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("CA certificate store is empty")
+        );
+    }
+
+    #[test]
+    fn client_config_missing_ca_errors() {
+        assert!(
+            client_tls_config(Some(std::path::Path::new("/nonexistent/ca.pem")), false, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("reading CA cert")
+        );
     }
 }
