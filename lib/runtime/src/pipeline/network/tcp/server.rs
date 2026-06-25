@@ -384,6 +384,7 @@ impl TcpStreamServer {
                     key.as_ref(),
                     client_ca.as_deref().map(std::path::Path::new),
                 )?;
+                tracing::info!("TCP server: TLS enabled");
                 Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(server_config)))))
             }
             (None, None) if client_ca.is_some() => anyhow::bail!(
@@ -392,7 +393,23 @@ impl TcpStreamServer {
                 env::DYN_TCP_TLS_CERT_PATH,
                 env::DYN_TCP_TLS_KEY_PATH,
             ),
-            (None, None) => Ok(None),
+            (None, None) => {
+                // Warn if the client side has TLS configured — mixing plaintext server with
+                // TLS client (or vice versa) results in failed connections that are hard to debug.
+                let client_tls_set = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).is_ok()
+                    || std::env::var(env::DYN_TCP_TLS_INSECURE)
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                if client_tls_set {
+                    tracing::warn!(
+                        "TCP server is running in plaintext mode but client TLS env vars are set. \
+                         Set {} and {} to enable server-side TLS, or unset client TLS vars.",
+                        env::DYN_TCP_TLS_CERT_PATH,
+                        env::DYN_TCP_TLS_KEY_PATH,
+                    );
+                }
+                Ok(None)
+            }
             _ => anyhow::bail!(
                 "Both {} and {} must be set to enable TCP TLS",
                 env::DYN_TCP_TLS_CERT_PATH,
@@ -682,10 +699,11 @@ async fn tcp_listener(
 
         // the internal tcp [`CallHomeHandshake`] connects the socket to the requester
         // here we await this first message as a raw bytes two part message
-        let first_message = framed_reader
-            .next()
-            .await
-            .ok_or(error!("Connection closed without a ControlMessage"))??;
+        let first_message =
+            tokio::time::timeout(std::time::Duration::from_secs(10), framed_reader.next())
+                .await
+                .map_err(|_| error!("Timed out waiting for CallHomeHandshake"))?
+                .ok_or(error!("Connection closed without a ControlMessage"))??;
 
         // we await on the raw bytes which should come in as a header only message
         // todo - improve error handling - check for no data
@@ -875,6 +893,8 @@ async fn tcp_listener(
 
         // the [`Prologue`]
         // there must be a second control message it indicate the other segment's generate method was successful
+        // No timeout here: the worker sends the prologue only after generate() setup completes,
+        // which can take arbitrarily long (model load, queue delay, cold start).
         let prologue = reader
             .next()
             .await
@@ -1114,8 +1134,67 @@ mod tests {
     use crate::engine::AsyncEngineContextProvider;
     use crate::pipeline::Context;
     use crate::pipeline::network::DEFAULT_SEND_BUFFER_COUNT;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
     use tokio::io::{AsyncWriteExt, ReadHalf, WriteHalf};
     use tokio::net::TcpStream;
+
+    fn make_cert_files() -> (NamedTempFile, NamedTempFile) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert.pem().as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file
+            .write_all(key_pair.serialize_pem().as_bytes())
+            .unwrap();
+        (cert_file, key_file)
+    }
+
+    #[test]
+    fn build_tls_acceptor_no_env_vars_is_plaintext() {
+        temp_env::with_vars_unset(["DYN_TCP_TLS_CERT_PATH", "DYN_TCP_TLS_KEY_PATH"], || {
+            assert!(TcpStreamServer::build_tls_acceptor().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn build_tls_acceptor_partial_config_errors() {
+        let (cert, key) = make_cert_files();
+        let cert_str = cert.path().to_str().unwrap();
+        let key_str = key.path().to_str().unwrap();
+        // only cert
+        temp_env::with_vars(
+            [
+                ("DYN_TCP_TLS_CERT_PATH", Some(cert_str)),
+                ("DYN_TCP_TLS_KEY_PATH", None),
+            ],
+            || assert!(TcpStreamServer::build_tls_acceptor().is_err()),
+        );
+        // only key
+        temp_env::with_vars(
+            [
+                ("DYN_TCP_TLS_CERT_PATH", None),
+                ("DYN_TCP_TLS_KEY_PATH", Some(key_str)),
+            ],
+            || assert!(TcpStreamServer::build_tls_acceptor().is_err()),
+        );
+    }
+
+    #[test]
+    fn build_tls_acceptor_both_paths_is_tls() {
+        let (cert, key) = make_cert_files();
+        temp_env::with_vars(
+            [
+                ("DYN_TCP_TLS_CERT_PATH", Some(cert.path().to_str().unwrap())),
+                ("DYN_TCP_TLS_KEY_PATH", Some(key.path().to_str().unwrap())),
+            ],
+            || assert!(TcpStreamServer::build_tls_acceptor().unwrap().is_some()),
+        );
+    }
 
     // Mock resolver that always fails to simulate the fallback scenario
     struct FailingIpResolver;
