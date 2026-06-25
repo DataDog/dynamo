@@ -13,6 +13,16 @@ use anyhow::{Context, Result};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pemfile::{certs, private_key};
 
+/// TLS handshake timeout, configurable via `DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS` (default: 3s).
+pub fn handshake_timeout() -> std::time::Duration {
+    use crate::config::environment_names::tcp_response_stream::tls as env;
+    let secs = std::env::var(env::DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(3);
+    std::time::Duration::from_secs(secs)
+}
+
 /// Build a rustls `ServerConfig` from PEM certificate and key files.
 ///
 /// - `client_ca_cert_path`: when `Some`, the server requires clients to
@@ -29,7 +39,7 @@ pub fn server_tls_config(
         std::fs::read(key_path).with_context(|| format!("reading key: {}", key_path.display()))?;
 
     let cert_chain = certs(&mut cert_pem.as_slice())
-        .collect::<std::result::Result<Vec<_>, _>>()
+        .collect::<Result<Vec<_>, _>>()
         .context("parsing certificate PEM")?;
 
     let key = private_key(&mut key_pem.as_slice())
@@ -89,10 +99,7 @@ pub fn client_tls_config(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     if insecure {
-        tracing::warn!(
-            "TCP TLS certificate verification is DISABLED — \
-             this must not be used in production"
-        );
+        tracing::info!("TCP TLS: certificate verification disabled (insecure mode)");
         let builder = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .context("configuring TLS protocol versions")?
@@ -127,7 +134,7 @@ pub fn client_tls_config(
         let ca_pem = std::fs::read(ca_path)
             .with_context(|| format!("reading CA cert: {}", ca_path.display()))?;
         let ca_certs = certs(&mut ca_pem.as_slice())
-            .collect::<std::result::Result<Vec<_>, _>>()
+            .collect::<Result<Vec<_>, _>>()
             .context("parsing CA certificate PEM")?;
         for cert in ca_certs {
             root_store

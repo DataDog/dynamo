@@ -612,6 +612,9 @@ pub mod tcp_response_stream {
         /// Path to the PEM CA certificate used by the TCP server to verify client certificates.
         /// When set, the server requires clients to present a valid certificate (mTLS).
         pub const DYN_TCP_TLS_CLIENT_CA_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CA_CERT_PATH";
+
+        /// TLS handshake timeout in seconds (default: 3).
+        pub const DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS: &str = "DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS";
     }
 }
 
@@ -848,6 +851,12 @@ mod tests {
             // TCP Response Stream
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_HOST,
+            tcp_response_stream::tls::DYN_TCP_TLS_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_KEY_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CA_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_INSECURE,
+            tcp_response_stream::tls::DYN_TCP_TLS_SERVER_NAME,
+            tcp_response_stream::tls::DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS,
             // Event Plane
             event_plane::DYN_EVENT_PLANE,
             event_plane::DYN_EVENT_PLANE_CODEC,
