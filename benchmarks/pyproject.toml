@@ -59,7 +59,7 @@ datagen = "prefix_data_generator.cli:main"
 Repository = "https://github.com/ai-dynamo/dynamo.git"
 
 [build-system]
-requires = ["setuptools>=42", "wheel"]
+requires = ["setuptools>=82.0.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
