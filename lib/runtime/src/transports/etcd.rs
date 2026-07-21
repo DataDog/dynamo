@@ -9,6 +9,7 @@ use derive_builder::Builder;
 use derive_getters::Dissolve;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use validator::Validate;
@@ -70,7 +71,14 @@ impl Client {
         let ((connector, lease_id), rt) = build_in_runtime(
             async move {
                 let etcd_urls = config.etcd_url.clone();
-                let connect_options = config.etcd_connect_options.clone();
+                let connect_options = match config.etcd_connect_options.clone() {
+                    Some(opts) => Some(opts),
+                    None => build_etcd_tls_connect_options(
+                        config.tls_ca_cert_path.as_deref(),
+                        config.tls_client_cert_path.as_deref(),
+                        config.tls_client_key_path.as_deref(),
+                    )?,
+                };
 
                 // Create the connector
                 let connector = Connector::new(etcd_urls, connect_options)
@@ -559,6 +567,16 @@ pub enum WatchEvent {
 }
 
 /// ETCD client configuration options
+///
+/// TLS configuration (parity with [`crate::transports::nats`]'s pattern): set
+/// [`ClientOptions::tls_ca_cert_path`] to verify the server's certificate, and both
+/// [`ClientOptions::tls_client_cert_path`] and [`ClientOptions::tls_client_key_path`] together to
+/// enable mutual TLS (mTLS). These are file paths, read at connect time.
+///
+/// This is distinct from the legacy `ETCD_AUTH_CA`/`ETCD_AUTH_CLIENT_CERT`/`ETCD_AUTH_CLIENT_KEY`
+/// mechanism (raw PEM content via `etcd_connect_options`), which continues to work unchanged and
+/// takes precedence over the `tls_*` fields when both are configured. Unlike NATS, the
+/// underlying `etcd-client` TLS stack has no insecure/skip-verification mode.
 #[derive(Debug, Clone, Builder, Validate)]
 pub struct ClientOptions {
     #[validate(length(min = 1))]
@@ -570,6 +588,18 @@ pub struct ClientOptions {
     /// If true, the client will attach a lease to the primary [`CancellationToken`].
     #[builder(default = "true")]
     pub attach_lease: bool,
+
+    /// Path to PEM CA certificate used to verify the ETCD server's certificate.
+    #[builder(default = "default_etcd_tls_ca_cert_path()")]
+    pub tls_ca_cert_path: Option<PathBuf>,
+
+    /// Path to PEM client certificate for mutual TLS (mTLS).
+    #[builder(default = "default_etcd_tls_client_cert_path()")]
+    pub tls_client_cert_path: Option<PathBuf>,
+
+    /// Path to PEM client private key for mutual TLS (mTLS).
+    #[builder(default = "default_etcd_tls_client_key_path()")]
+    pub tls_client_key_path: Option<PathBuf>,
 }
 
 impl Default for ClientOptions {
@@ -601,6 +631,9 @@ impl Default for ClientOptions {
             etcd_url: default_servers(),
             etcd_connect_options: connect_options,
             attach_lease: true,
+            tls_ca_cert_path: default_etcd_tls_ca_cert_path(),
+            tls_client_cert_path: default_etcd_tls_client_cert_path(),
+            tls_client_key_path: default_etcd_tls_client_key_path(),
         }
     }
 }
@@ -613,6 +646,76 @@ fn default_servers() -> Vec<String> {
             .collect(),
         Err(_) => vec!["http://localhost:2379".to_string()],
     }
+}
+
+fn default_etcd_tls_ca_cert_path() -> Option<PathBuf> {
+    std::env::var(env_etcd::tls::ETCD_TLS_CA_CERT_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_etcd_tls_client_cert_path() -> Option<PathBuf> {
+    std::env::var(env_etcd::tls::ETCD_TLS_CLIENT_CERT_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_etcd_tls_client_key_path() -> Option<PathBuf> {
+    std::env::var(env_etcd::tls::ETCD_TLS_CLIENT_KEY_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// Build [`ConnectOptions`] from file-path-based TLS configuration.
+///
+/// Returns `Ok(None)` if no TLS paths are set. Returns an error if only one of
+/// `client_cert_path`/`client_key_path` is set, or if a configured file cannot be read.
+fn build_etcd_tls_connect_options(
+    ca_cert_path: Option<&Path>,
+    client_cert_path: Option<&Path>,
+    client_key_path: Option<&Path>,
+) -> Result<Option<ConnectOptions>> {
+    if client_cert_path.is_some() != client_key_path.is_some() {
+        anyhow::bail!(
+            "Both {} and {} must be set together to enable ETCD mTLS",
+            env_etcd::tls::ETCD_TLS_CLIENT_CERT_PATH,
+            env_etcd::tls::ETCD_TLS_CLIENT_KEY_PATH,
+        );
+    }
+
+    if ca_cert_path.is_none() && client_cert_path.is_none() {
+        return Ok(None);
+    }
+
+    let mut tls_options = TlsOptions::new();
+
+    if let Some(ca_cert_path) = ca_cert_path {
+        let ca_pem = std::fs::read(ca_cert_path).with_context(|| {
+            format!(
+                "Failed to read ETCD TLS CA certificate at {}",
+                ca_cert_path.display()
+            )
+        })?;
+        tls_options = tls_options.ca_certificate(Certificate::from_pem(ca_pem));
+    }
+
+    if let (Some(client_cert_path), Some(client_key_path)) = (client_cert_path, client_key_path) {
+        let cert_pem = std::fs::read(client_cert_path).with_context(|| {
+            format!(
+                "Failed to read ETCD TLS client certificate at {}",
+                client_cert_path.display()
+            )
+        })?;
+        let key_pem = std::fs::read(client_key_path).with_context(|| {
+            format!(
+                "Failed to read ETCD TLS client key at {}",
+                client_key_path.display()
+            )
+        })?;
+        tls_options = tls_options.identity(Identity::from_pem(cert_pem, key_pem));
+    }
+
+    Ok(Some(ConnectOptions::new().with_tls(tls_options)))
 }
 
 /// A cache for etcd key-value pairs that watches for changes
@@ -747,6 +850,127 @@ impl KvCache {
         cache_write.remove(&full_key);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tls_config_tests {
+    use super::*;
+    use figment::Jail;
+    use std::io::Write;
+
+    #[test]
+    fn test_client_options_builder_defaults_no_tls() {
+        Jail::expect_with(|_jail| {
+            let opts = Client::builder().etcd_url(default_servers()).build();
+            assert!(opts.is_ok());
+            let opts = opts.unwrap();
+
+            assert!(opts.tls_ca_cert_path.is_none());
+            assert!(opts.tls_client_cert_path.is_none());
+            assert!(opts.tls_client_key_path.is_none());
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_client_options_builder_reads_tls_env_vars() {
+        Jail::expect_with(|jail| {
+            jail.set_env(env_etcd::tls::ETCD_TLS_CA_CERT_PATH, "/tmp/ca.pem");
+            jail.set_env(
+                env_etcd::tls::ETCD_TLS_CLIENT_CERT_PATH,
+                "/tmp/client.pem",
+            );
+            jail.set_env(env_etcd::tls::ETCD_TLS_CLIENT_KEY_PATH, "/tmp/client.key");
+
+            let opts = Client::builder().etcd_url(default_servers()).build();
+            assert!(opts.is_ok());
+            let opts = opts.unwrap();
+
+            assert_eq!(opts.tls_ca_cert_path, Some(PathBuf::from("/tmp/ca.pem")));
+            assert_eq!(
+                opts.tls_client_cert_path,
+                Some(PathBuf::from("/tmp/client.pem"))
+            );
+            assert_eq!(
+                opts.tls_client_key_path,
+                Some(PathBuf::from("/tmp/client.key"))
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_default_leaves_new_fields_unset_without_env() {
+        Jail::expect_with(|_jail| {
+            let opts = ClientOptions::default();
+            assert!(opts.tls_ca_cert_path.is_none());
+            assert!(opts.tls_client_cert_path.is_none());
+            assert!(opts.tls_client_key_path.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_build_etcd_tls_connect_options_none_when_unset() {
+        let result = build_etcd_tls_connect_options(None, None, None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_build_etcd_tls_connect_options_ca_only() {
+        let mut ca_file = tempfile::NamedTempFile::new().unwrap();
+        ca_file.write_all(b"fake-ca-pem").unwrap();
+
+        let result = build_etcd_tls_connect_options(Some(ca_file.path()), None, None);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_build_etcd_tls_connect_options_mtls() {
+        let mut ca_file = tempfile::NamedTempFile::new().unwrap();
+        ca_file.write_all(b"fake-ca-pem").unwrap();
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(b"fake-cert-pem").unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file.write_all(b"fake-key-pem").unwrap();
+
+        let result = build_etcd_tls_connect_options(
+            Some(ca_file.path()),
+            Some(cert_file.path()),
+            Some(key_file.path()),
+        );
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_build_etcd_tls_connect_options_mismatched_cert_and_key_errors() {
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(b"fake-cert-pem").unwrap();
+
+        let cert_only = build_etcd_tls_connect_options(None, Some(cert_file.path()), None);
+        assert!(cert_only.is_err());
+
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file.write_all(b"fake-key-pem").unwrap();
+
+        let key_only = build_etcd_tls_connect_options(None, None, Some(key_file.path()));
+        assert!(key_only.is_err());
+    }
+
+    #[test]
+    fn test_build_etcd_tls_connect_options_missing_file_errors() {
+        let result = build_etcd_tls_connect_options(
+            Some(Path::new("/nonexistent/ca.pem")),
+            None,
+            None,
+        );
+        assert!(result.is_err());
     }
 }
 

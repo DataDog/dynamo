@@ -1414,6 +1414,25 @@ func AddStandardEnvVars(container *corev1.Container, operatorConfig *configv1alp
 		})
 	}
 
+	if operatorConfig.Infrastructure.ETCDTLSCAPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "ETCD_TLS_CA_CERT_PATH",
+			Value: operatorConfig.Infrastructure.ETCDTLSCAPath,
+		})
+	}
+	if operatorConfig.Infrastructure.ETCDTLSClientCertPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "ETCD_TLS_CLIENT_CERT_PATH",
+			Value: operatorConfig.Infrastructure.ETCDTLSClientCertPath,
+		})
+	}
+	if operatorConfig.Infrastructure.ETCDTLSClientKeyPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "ETCD_TLS_CLIENT_KEY_PATH",
+			Value: operatorConfig.Infrastructure.ETCDTLSClientKeyPath,
+		})
+	}
+
 	if operatorConfig.Infrastructure.ModelExpressURL != "" {
 		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
 			Name:  "MODEL_EXPRESS_URL",

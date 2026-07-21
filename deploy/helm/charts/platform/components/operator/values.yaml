@@ -157,6 +157,11 @@ tcpTLSClientCertPath: ""
 tcpTLSClientKeyPath: ""
 tcpTLSClientCAPath: ""
 etcdAddr: ""
+# etcdTLSCAPath: auto-inject ETCD_TLS_CA_CERT_PATH into every DGD pod.
+# Example (emissary filemode): /etc/emissary/certs/server/ca.pem
+etcdTLSCAPath: ""
+etcdTLSClientCertPath: ""
+etcdTLSClientKeyPath: ""
 
 modelExpressURL: ""
 

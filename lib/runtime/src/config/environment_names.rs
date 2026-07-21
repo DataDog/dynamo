@@ -192,6 +192,23 @@ pub mod etcd {
         /// Path to client key for ETCD TLS
         pub const ETCD_AUTH_CLIENT_KEY: &str = "ETCD_AUTH_CLIENT_KEY";
     }
+
+    /// ETCD TLS configuration (file-path based, parity with the `nats::tls` pattern).
+    /// Distinct from `auth::ETCD_AUTH_CA`/`ETCD_AUTH_CLIENT_CERT`/`ETCD_AUTH_CLIENT_KEY`,
+    /// which read raw PEM content directly from the environment variable value.
+    /// The legacy `auth` variables take precedence over these when both are set.
+    pub mod tls {
+        /// Path to the PEM CA certificate used to verify the ETCD server's certificate.
+        pub const ETCD_TLS_CA_CERT_PATH: &str = "ETCD_TLS_CA_CERT_PATH";
+
+        /// Path to the PEM client certificate for mutual TLS (mTLS) with ETCD.
+        /// Must be set together with ETCD_TLS_CLIENT_KEY_PATH.
+        pub const ETCD_TLS_CLIENT_CERT_PATH: &str = "ETCD_TLS_CLIENT_CERT_PATH";
+
+        /// Path to the PEM client private key for mutual TLS (mTLS) with ETCD.
+        /// Must be set together with ETCD_TLS_CLIENT_CERT_PATH.
+        pub const ETCD_TLS_CLIENT_KEY_PATH: &str = "ETCD_TLS_CLIENT_KEY_PATH";
+    }
 }
 
 /// Key-Value Block Manager (KVBM) environment variables

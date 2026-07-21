@@ -241,6 +241,16 @@ type InfrastructureConfiguration struct {
 	TCPTLSClientCAPath string `json:"tcpTLSClientCAPath,omitempty"`
 	// ETCDAddress is the address of the etcd server
 	ETCDAddress string `json:"etcdAddress"`
+	// ETCDTLSCAPath is the path to the CA certificate used to verify the etcd server TLS
+	// certificate. When set, ETCD_TLS_CA_CERT_PATH is injected into every DGD pod so clients
+	// can connect to a TLS-enabled etcd server without per-DGD configuration.
+	ETCDTLSCAPath string `json:"etcdTLSCAPath,omitempty"`
+	// ETCDTLSClientCertPath is injected as ETCD_TLS_CLIENT_CERT_PATH (client cert for etcd mTLS).
+	// Must be set together with ETCDTLSClientKeyPath.
+	ETCDTLSClientCertPath string `json:"etcdTLSClientCertPath,omitempty"`
+	// ETCDTLSClientKeyPath is injected as ETCD_TLS_CLIENT_KEY_PATH (client key for etcd mTLS).
+	// Must be set together with ETCDTLSClientCertPath.
+	ETCDTLSClientKeyPath string `json:"etcdTLSClientKeyPath,omitempty"`
 	// ModelExpressURL is the URL of the Model Express server to inject into all pods
 	ModelExpressURL string `json:"modelExpressURL"`
 	// PrometheusEndpoint is the URL of the Prometheus endpoint to use for metrics
