@@ -28,6 +28,13 @@ pub(super) async fn run_event_processor_loop<P: RouterEventSink + Send + Sync + 
     timeout_ms: Option<u64>,
     max_batch_blocks: usize,
 ) {
+    tracing::info!(
+        worker_id,
+        has_local_indexer = local_indexer.is_some(),
+        timeout_ms,
+        "KV event processor loop started on secondary Tokio runtime"
+    );
+
     let mut batching_state = BatchingState::new();
     let mut dedup = EventDedupFilter::new();
     let mut last_raw_input_id: Option<u64> = None;
@@ -45,6 +52,12 @@ pub(super) async fn run_event_processor_loop<P: RouterEventSink + Send + Sync + 
                     batching_state.flush(&publisher, &local_indexer, worker_id, &mut dedup).await;
                     break;
                 };
+
+                tracing::debug!(
+                    worker_id,
+                    event_id = placement_event.event.event_id,
+                    "KV event processor dequeued event from channel"
+                );
 
                 let raw_event_id = placement_event.event.event_id;
                 if let Some(last_id) = last_raw_input_id

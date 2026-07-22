@@ -720,6 +720,12 @@ pub mod kv_publisher {
 
     /// Total number of suspicious-but-forwarded ZMQ KV events, labeled by event type and reason
     pub const ZMQ_SUSPICIOUS_EVENTS_TOTAL: &str = "kv_publisher_zmq_suspicious_events_total";
+
+    /// Total number of KV events successfully emitted to the NATS transport
+    pub const NATS_EMIT_SUCCESSES_TOTAL: &str = "kv_publisher_nats_emit_successes_total";
+
+    /// Total number of KV event emit attempts that failed on the NATS transport
+    pub const NATS_EMIT_ERRORS_TOTAL: &str = "kv_publisher_nats_emit_errors_total";
 }
 
 /// Additional TRT-LLM worker metrics beyond what the engine natively provides.

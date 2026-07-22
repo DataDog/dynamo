@@ -89,6 +89,10 @@ pub(crate) struct KvPublisherMetrics {
     pub zmq_conversion_issues_total: IntCounterVec,
     /// Total number of suspicious-but-forwarded ZMQ KV events.
     pub zmq_suspicious_events_total: IntCounterVec,
+    /// Total number of KV events successfully emitted to the NATS transport.
+    pub nats_emit_successes_total: IntCounter,
+    /// Total number of KV event emit attempts that failed on the NATS transport.
+    pub nats_emit_errors_total: IntCounter,
 }
 
 static KV_PUBLISHER_METRICS: OnceLock<Arc<KvPublisherMetrics>> = OnceLock::new();
@@ -141,6 +145,20 @@ impl KvPublisherMetrics {
                         &[],
                     )
                     .expect("failed to create kv_publisher_zmq_suspicious_events_total");
+                let nats_emit_successes_total = metrics
+                    .create_intcounter(
+                        kv_publisher::NATS_EMIT_SUCCESSES_TOTAL,
+                        "Total number of KV events successfully emitted to the NATS transport",
+                        &[],
+                    )
+                    .expect("failed to create kv_publisher_nats_emit_successes_total");
+                let nats_emit_errors_total = metrics
+                    .create_intcounter(
+                        kv_publisher::NATS_EMIT_ERRORS_TOTAL,
+                        "Total number of KV event emit attempts that failed on the NATS transport",
+                        &[],
+                    )
+                    .expect("failed to create kv_publisher_nats_emit_errors_total");
 
                 Arc::new(Self {
                     engines_dropped_events_total,
@@ -148,6 +166,8 @@ impl KvPublisherMetrics {
                     zmq_filtered_events_total,
                     zmq_conversion_issues_total,
                     zmq_suspicious_events_total,
+                    nats_emit_successes_total,
+                    nats_emit_errors_total,
                 })
             })
             .clone()
@@ -180,6 +200,16 @@ impl KvPublisherMetrics {
         self.zmq_suspicious_events_total
             .with_label_values(&[event_type, reason])
             .inc();
+    }
+
+    /// Increment the NATS emit success counter.
+    pub fn increment_nats_emit_success(&self) {
+        self.nats_emit_successes_total.inc();
+    }
+
+    /// Increment the NATS emit error counter.
+    pub fn increment_nats_emit_error(&self) {
+        self.nats_emit_errors_total.inc();
     }
 }
 

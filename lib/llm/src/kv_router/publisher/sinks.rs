@@ -13,6 +13,7 @@ use dynamo_runtime::transports::event_plane::EventPublisher;
 use dynamo_runtime::transports::nats::NatsQueue;
 
 use crate::kv_router::KV_EVENT_SUBJECT;
+use crate::kv_router::metrics::kv_publisher_metrics;
 
 pub(super) struct EventPlanePublisher(pub(super) EventPublisher);
 
@@ -43,7 +44,17 @@ pub(super) async fn emit<P: RouterEventSink>(
     {
         tracing::warn!(worker_id, error = %e, "Failed to apply event to local indexer");
     }
+
+    tracing::info!(worker_id, "Calling publish_event on NATS transport");
     if let Err(e) = publisher.publish_event(&router_event).await {
         tracing::error!(worker_id, error = %e, "Failed to publish event");
+        if let Some(metrics) = kv_publisher_metrics() {
+            metrics.increment_nats_emit_error();
+        }
+    } else {
+        tracing::debug!(worker_id, "Successfully published KV event to NATS transport");
+        if let Some(metrics) = kv_publisher_metrics() {
+            metrics.increment_nats_emit_success();
+        }
     }
 }
