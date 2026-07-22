@@ -256,11 +256,13 @@ impl KvEventPublisher {
         if enable_local_indexer {
             tracing::info!("Using event plane for KV event publishing (local_indexer mode)");
             let component_clone = component.clone();
-            // Spawn on primary Tokio runtime: the EventPlanePublisher calls async_nats
-            // publish() which awaits a channel tied to the primary runtime's I/O tasks.
-            // Using secondary().spawn() deadlocks because the NATS I/O driver never gets
-            // polled from the secondary runtime — kv-events never reach NATS.
-            tokio::spawn(async move {
+            // Spawn on primary Tokio runtime via an explicit Handle so this works even when
+            // called from a non-async context (e.g. a PyO3 Python thread with no active
+            // runtime). tokio::spawn() panics in that case; Handle::spawn() does not.
+            // The EventPlanePublisher calls async_nats publish() which awaits a channel
+            // tied to the primary runtime's I/O tasks — must run there, not on secondary.
+            let primary_handle = component.drt().runtime().primary();
+            primary_handle.spawn(async move {
                 let event_publisher =
                     match dynamo_runtime::transports::event_plane::EventPublisher::for_component(
                         &component_clone,
@@ -295,9 +297,11 @@ impl KvEventPublisher {
                 std::time::Duration::from_secs(60),
             );
 
-            // Same fix: spawn on primary runtime to avoid cross-runtime deadlock
-            // with the async_nats client's I/O tasks.
-            tokio::spawn(async move {
+            // Same fix: use Handle::spawn() so this works from non-async contexts
+            // (PyO3 Python threads). Spawns on primary runtime to avoid cross-runtime
+            // deadlock with the async_nats client's I/O tasks.
+            let primary_handle = component.drt().runtime().primary();
+            primary_handle.spawn(async move {
                 if let Err(e) = nats_queue.connect().await {
                     tracing::error!("Failed to connect NatsQueue: {e}");
                     return;
