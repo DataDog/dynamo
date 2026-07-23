@@ -365,12 +365,6 @@ impl ClientOptions {
     pub async fn connect(self) -> Result<Client> {
         self.validate()?;
 
-        // Install the ring crypto provider as the process-level default so that
-        // async-nats can use rustls internally (e.g. when the URL uses tls://)
-        // even if our custom TLS config path is not taken. Silently ignored if a
-        // provider is already installed.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
         let mut options = match self.auth {
             NatsAuth::UserPass(username, password) => {
                 async_nats::ConnectOptions::with_user_and_password(username, password)
@@ -392,13 +386,10 @@ impl ClientOptions {
         }
 
         // Apply TLS when a CA cert path is provided, insecure mode is requested,
-        // a client cert is set, or the server URL uses tls:// scheme.
-        // Detecting tls:// ensures our custom TLS config is applied (and the ring
-        // provider used) rather than falling back to async-nats internal handling.
+        // or a client cert is set. When both client cert and key are set, mTLS is used.
         let tls_enabled = self.tls_ca_cert_path.is_some()
             || self.tls_insecure
-            || self.tls_client_cert_path.is_some()
-            || self.server.starts_with("tls://");
+            || self.tls_client_cert_path.is_some();
         if tls_enabled {
             let tls_config = crate::tls_utils::client_tls_config(
                 self.tls_ca_cert_path.as_deref(),
@@ -415,9 +406,9 @@ impl ClientOptions {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&secs| secs > 0)
             .map(time::Duration::from_secs);
-        let client = match request_timeout {
-            Some(timeout) => client.request_timeout(Some(timeout)),
-            None => client,
+        let options = match request_timeout {
+            Some(timeout) => options.request_timeout(Some(timeout)),
+            None => options,
         };
 
         let (client, _) = build_in_runtime(
