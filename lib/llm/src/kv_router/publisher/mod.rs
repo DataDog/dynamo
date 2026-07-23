@@ -256,21 +256,49 @@ impl KvEventPublisher {
         if enable_local_indexer {
             tracing::info!("Using event plane for KV event publishing (local_indexer mode)");
             let component_clone = component.clone();
+
+            // KV-DIAG: log context before spawn — are we inside a Tokio runtime?
+            match tokio::runtime::Handle::try_current() {
+                Ok(_) => tracing::warn!(
+                    "KV-DIAG [pre-spawn]: called from WITHIN a Tokio runtime context (expected for future_into_py path)"
+                ),
+                Err(_) => tracing::warn!(
+                    "KV-DIAG [pre-spawn]: called from OUTSIDE any Tokio runtime (Python thread / non-async context)"
+                ),
+            }
+            tracing::warn!("KV-DIAG [spawn]: spawning event processor on secondary() runtime handle (pre-fix / diag build)");
+
             component.drt().runtime().secondary().spawn(async move {
-                let event_publisher =
-                    match dynamo_runtime::transports::event_plane::EventPublisher::for_component(
+                tracing::warn!("KV-DIAG [task]: event processor task entered on secondary() runtime");
+
+                // KV-DIAG: wrap for_component with a timeout to detect deadlocks
+                let event_publisher = match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    dynamo_runtime::transports::event_plane::EventPublisher::for_component(
                         &component_clone,
                         KV_EVENT_SUBJECT,
-                    )
-                    .await
-                    {
-                        Ok(publisher) => publisher,
-                        Err(e) => {
-                            tracing::error!("Failed to create event publisher: {}", e);
-                            return;
-                        }
-                    };
+                    ),
+                )
+                .await
+                {
+                    Ok(Ok(publisher)) => {
+                        tracing::warn!("KV-DIAG [task]: EventPublisher::for_component() succeeded");
+                        publisher
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("KV-DIAG [task]: EventPublisher::for_component() returned error: {}", e);
+                        return;
+                    }
+                    Err(_timeout) => {
+                        tracing::error!(
+                            "KV-DIAG [task]: EventPublisher::for_component() TIMED OUT after 30s — \
+                             likely cross-runtime deadlock or NATS unreachable"
+                        );
+                        return;
+                    }
+                };
 
+                tracing::warn!("KV-DIAG [task]: starting event processor loop (rx.recv() loop)");
                 start_event_processor(
                     EventPlanePublisher(event_publisher),
                     worker_id,
@@ -279,7 +307,8 @@ impl KvEventPublisher {
                     local_indexer_clone,
                     batching_timeout_ms,
                 )
-                .await
+                .await;
+                tracing::warn!("KV-DIAG [task]: event processor loop exited");
             });
         } else {
             let stream_name = create_kv_stream_name(&component, KV_EVENT_SUBJECT);
@@ -291,11 +320,24 @@ impl KvEventPublisher {
                 std::time::Duration::from_secs(60),
             );
 
+            tracing::warn!("KV-DIAG [spawn-jetstream]: spawning jetstream event processor on secondary() runtime handle (pre-fix / diag build)");
             component.drt().runtime().secondary().spawn(async move {
-                if let Err(e) = nats_queue.connect().await {
-                    tracing::error!("Failed to connect NatsQueue: {e}");
-                    return;
+                tracing::warn!("KV-DIAG [task-jetstream]: jetstream event processor task entered");
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    nats_queue.connect(),
+                ).await {
+                    Ok(Ok(())) => tracing::warn!("KV-DIAG [task-jetstream]: NatsQueue connected"),
+                    Ok(Err(e)) => {
+                        tracing::error!("KV-DIAG [task-jetstream]: Failed to connect NatsQueue: {e}");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::error!("KV-DIAG [task-jetstream]: NatsQueue connect() TIMED OUT after 30s");
+                        return;
+                    }
                 }
+                tracing::warn!("KV-DIAG [task-jetstream]: starting jetstream event processor loop");
                 start_event_processor_jetstream(
                     nats_queue,
                     worker_id,
@@ -304,7 +346,8 @@ impl KvEventPublisher {
                     local_indexer_clone,
                     batching_timeout_ms,
                 )
-                .await
+                .await;
+                tracing::warn!("KV-DIAG [task-jetstream]: jetstream event processor loop exited");
             });
         }
 

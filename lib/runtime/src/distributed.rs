@@ -480,7 +480,8 @@ impl DistributedRuntime {
     ) -> anyhow::Result<()> {
         let Some(nats_client) = self.nats_client.as_ref() else {
             // NATS not available - this is expected in approximate mode (--no-kv-events)
-            tracing::trace!("Skipping NATS publish (NATS not configured): {subject}");
+            // KV-DIAG: upgraded to WARN so it's visible without RUST_LOG=trace
+            tracing::warn!("KV-DIAG: Skipping NATS publish - nats_client is None (NATS not configured). Subject: {subject}. This means no KV events will be published. Check DYN_EVENT_PLANE env var.");
             return Ok(());
         };
         Ok(nats_client.client().publish(subject, payload).await?)
