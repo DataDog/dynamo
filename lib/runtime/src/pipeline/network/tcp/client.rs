@@ -284,20 +284,12 @@ fn build_tls_connector_from_env() -> anyhow::Result<Option<TlsConnector>> {
     let client_cert = std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).ok();
     let client_key = std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).ok();
 
-    // Fail fast on partial mTLS client config.
-    if client_cert.is_some() != client_key.is_some() {
-        anyhow::bail!(
-            "Both {} and {} must be set together to enable TCP mTLS",
-            env::DYN_TCP_TLS_CLIENT_CERT_PATH,
-            env::DYN_TCP_TLS_CLIENT_KEY_PATH,
-        );
-    }
-
     // Any TLS env var set → TLS is intended; missing CA without insecure is an error.
-    let tls_requested = ca_cert_path.is_some() || insecure || client_cert.is_some();
+    // Partial mTLS config (cert without key or vice versa) is rejected downstream
+    // by `tls_utils::client_tls_config`.
+    let tls_requested =
+        ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
     if !tls_requested {
-        // Warn if the server side has TLS configured — a plaintext client connecting to a
-        // TLS server will fail with an opaque framing error rather than a clear TLS error.
         let server_tls_set = std::env::var(env::DYN_TCP_TLS_CERT_PATH).is_ok();
         if server_tls_set {
             tracing::warn!(
