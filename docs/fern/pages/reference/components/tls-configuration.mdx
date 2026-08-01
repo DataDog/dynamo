@@ -140,6 +140,40 @@ server and client depending on the stream direction.
 > allowing TLS to be configured once at the platform level and auto-injected
 > into all DGD pods without per-component env var setup.
 
+## Mutual TLS (mTLS)
+
+mTLS adds client certificate authentication on top of TLS. The server verifies
+the client's identity before accepting the connection.
+
+### TCP mTLS
+
+| Variable | Description |
+|---|---|
+| `DYN_TCP_TLS_CLIENT_CERT_PATH` | Client certificate presented to the TCP server. |
+| `DYN_TCP_TLS_CLIENT_KEY_PATH` | Private key for the client certificate. |
+| `DYN_TCP_TLS_CLIENT_CA_CERT_PATH` | CA certificate the server uses to verify client certificates. When set, clients must present a valid certificate. |
+
+### NATS mTLS
+
+| Variable | Description |
+|---|---|
+| `NATS_TLS_CLIENT_CERT_PATH` | Client certificate presented to the NATS server. Must be set with `NATS_TLS_CLIENT_KEY_PATH`. |
+| `NATS_TLS_CLIENT_KEY_PATH` | Private key for the NATS client certificate. |
+
+NATS mTLS requires `NATS_TLS_CA_CERT_PATH` to also be set.
+
+### mTLS CLI flags
+
+All backends via `DynamoRuntimeArgGroup`:
+
+```
+--tcp-tls-client-cert-path PATH      TCP client certificate (PEM)
+--tcp-tls-client-key-path PATH       TCP client private key (PEM)
+--tcp-tls-client-ca-cert-path PATH   CA for TCP client cert verification (PEM)
+--nats-tls-client-cert-path PATH     NATS client certificate (PEM)
+--nats-tls-client-key-path PATH      NATS client private key (PEM)
+```
+
 ## NATS TLS
 
 NATS is used for JetStream indexer recovery/replay and the audit sink. TLS
