@@ -179,6 +179,8 @@ navigation:
             contents:
               - page: Service Discovery
                 path: kubernetes/service-discovery.md
+              - page: TCP TLS
+                path: kubernetes/tls.md
               - page: Webhooks
                 path: kubernetes/webhooks.md
               - page: Snapshotting GPU Workers
