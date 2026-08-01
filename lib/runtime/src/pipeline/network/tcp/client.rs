@@ -281,11 +281,12 @@ fn build_tls_connector_from_env() -> anyhow::Result<Option<TlsConnector>> {
     use crate::config::environment_names::tcp_response_stream::tls as env;
     let ca_cert_path = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).ok();
     let insecure = crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE);
+    let client_cert = std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).ok();
+    let client_key = std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).ok();
 
-    let tls_requested = ca_cert_path.is_some() || insecure;
+    let tls_requested =
+        ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
     if !tls_requested {
-        // Warn if the server side has TLS configured — a plaintext client connecting to a
-        // TLS server will fail with an opaque framing error rather than a clear TLS error.
         let server_tls_set = std::env::var(env::DYN_TCP_TLS_CERT_PATH).is_ok();
         if server_tls_set {
             tracing::warn!(
@@ -310,6 +311,8 @@ fn build_tls_connector_from_env() -> anyhow::Result<Option<TlsConnector>> {
     let tls_config = crate::tls_utils::client_tls_config(
         ca_cert_path.as_deref().map(std::path::Path::new),
         insecure,
+        client_cert.as_deref().map(std::path::Path::new),
+        client_key.as_deref().map(std::path::Path::new),
     )?;
     Ok(Some(TlsConnector::from(Arc::new(tls_config))))
 }

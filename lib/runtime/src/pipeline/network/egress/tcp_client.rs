@@ -396,6 +396,8 @@ fn get_request_plane_tls_connector() -> anyhow::Result<&'static Option<TlsConnec
         let tls_config = crate::tls_utils::client_tls_config(
             ca_cert_path.as_deref().map(std::path::Path::new),
             insecure,
+            None,
+            None,
         )?;
         Ok(Some(TlsConnector::from(std::sync::Arc::new(tls_config))))
     })

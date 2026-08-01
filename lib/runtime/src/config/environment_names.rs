@@ -180,6 +180,14 @@ pub mod nats {
         /// When set, a custom TLS config with this CA is applied to the NATS connection.
         pub const NATS_TLS_CA_CERT_PATH: &str = "NATS_TLS_CA_CERT_PATH";
 
+        /// Path to the PEM client certificate for mutual TLS (mTLS) with NATS.
+        /// Must be set together with NATS_TLS_CLIENT_KEY_PATH.
+        pub const NATS_TLS_CLIENT_CERT_PATH: &str = "NATS_TLS_CLIENT_CERT_PATH";
+
+        /// Path to the PEM client private key for mutual TLS (mTLS) with NATS.
+        /// Must be set together with NATS_TLS_CLIENT_CERT_PATH.
+        pub const NATS_TLS_CLIENT_KEY_PATH: &str = "NATS_TLS_CLIENT_KEY_PATH";
+
         /// Disable TLS certificate verification. Set to a truthy value to skip.
         /// WARNING: Only for local development. Never use in production.
         pub const NATS_TLS_INSECURE: &str = "NATS_TLS_INSECURE";
@@ -718,6 +726,17 @@ pub mod tcp_response_stream {
         /// uses a DNS SAN.
         pub const DYN_TCP_TLS_SERVER_NAME: &str = "DYN_TCP_TLS_SERVER_NAME";
 
+        /// Path to the PEM client certificate presented by TCP clients to the server.
+        /// Must be set together with DYN_TCP_TLS_CLIENT_KEY_PATH to enable mTLS.
+        pub const DYN_TCP_TLS_CLIENT_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CERT_PATH";
+
+        /// Path to the PEM private key for the TCP client certificate.
+        pub const DYN_TCP_TLS_CLIENT_KEY_PATH: &str = "DYN_TCP_TLS_CLIENT_KEY_PATH";
+
+        /// Path to the PEM CA certificate used by the TCP server to verify client certificates.
+        /// When set, the server requires clients to present a valid certificate (mTLS).
+        pub const DYN_TCP_TLS_CLIENT_CA_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CA_CERT_PATH";
+
         /// TLS handshake timeout in seconds (default: 3).
         pub const DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS: &str = "DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS";
     }
@@ -873,6 +892,8 @@ mod tests {
             nats::auth::NATS_AUTH_CREDENTIALS_FILE,
             nats::stream::DYN_NATS_STREAM_MAX_AGE,
             nats::tls::NATS_TLS_CA_CERT_PATH,
+            nats::tls::NATS_TLS_CLIENT_CERT_PATH,
+            nats::tls::NATS_TLS_CLIENT_KEY_PATH,
             nats::tls::NATS_TLS_INSECURE,
             // ETCD
             etcd::ETCD_ENDPOINTS,
@@ -980,6 +1001,9 @@ mod tests {
             tcp_response_stream::tls::DYN_TCP_TLS_CA_CERT_PATH,
             tcp_response_stream::tls::DYN_TCP_TLS_INSECURE,
             tcp_response_stream::tls::DYN_TCP_TLS_SERVER_NAME,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_KEY_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_CA_CERT_PATH,
             tcp_response_stream::tls::DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS,
             // Event Plane
             event_plane::DYN_EVENT_PLANE,
