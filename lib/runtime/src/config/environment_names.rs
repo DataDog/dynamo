@@ -766,6 +766,8 @@ mod tests {
             nats::auth::NATS_AUTH_NKEY,
             nats::auth::NATS_AUTH_CREDENTIALS_FILE,
             nats::stream::DYN_NATS_STREAM_MAX_AGE,
+            nats::tls::NATS_TLS_CA_CERT_PATH,
+            nats::tls::NATS_TLS_INSECURE,
             // ETCD
             etcd::ETCD_ENDPOINTS,
             etcd::ETCD_LEASE_TTL,
