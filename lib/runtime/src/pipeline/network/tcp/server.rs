@@ -384,7 +384,11 @@ impl TcpStreamServer {
                     key.as_ref(),
                     client_ca.as_deref().map(std::path::Path::new),
                 )?;
-                tracing::info!("TCP server: TLS enabled");
+                if client_ca.is_some() {
+                    tracing::info!("TCP server: mTLS enabled (client certificates required)");
+                } else {
+                    tracing::info!("TCP server: TLS enabled");
+                }
                 Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(server_config)))))
             }
             (None, None) if client_ca.is_some() => anyhow::bail!(
@@ -394,8 +398,6 @@ impl TcpStreamServer {
                 env::DYN_TCP_TLS_KEY_PATH,
             ),
             (None, None) => {
-                // Warn if the client side has TLS configured — mixing plaintext server with
-                // TLS client (or vice versa) results in failed connections that are hard to debug.
                 let client_tls_set = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).is_ok()
                     || crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE);
                 if client_tls_set {
