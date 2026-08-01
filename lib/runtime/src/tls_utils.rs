@@ -23,7 +23,15 @@ pub fn handshake_timeout() -> std::time::Duration {
 }
 
 /// Build a rustls `ServerConfig` from PEM certificate and key files.
-pub fn server_tls_config(cert_path: &Path, key_path: &Path) -> Result<ServerConfig> {
+///
+/// When `client_ca_cert_path` is `Some`, the server requires clients to present
+/// a certificate signed by that CA (mutual TLS). When `None`, client
+/// certificates are not requested.
+pub fn server_tls_config(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_cert_path: Option<&Path>,
+) -> Result<ServerConfig> {
     let cert_pem = std::fs::read(cert_path)
         .with_context(|| format!("reading cert: {}", cert_path.display()))?;
     let key_pem =
@@ -38,12 +46,38 @@ pub fn server_tls_config(cert_path: &Path, key_path: &Path) -> Result<ServerConf
         .context("no private key found in PEM")?;
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = ServerConfig::builder_with_provider(provider)
+    let builder = ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .context("configuring TLS protocol versions")?
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, key)
-        .context("building ServerConfig")?;
+        .context("configuring TLS protocol versions")?;
+
+    let config = if let Some(ca_path) = client_ca_cert_path {
+        let ca_pem = std::fs::read(ca_path)
+            .with_context(|| format!("reading client CA cert: {}", ca_path.display()))?;
+        let ca_certs = certs(&mut ca_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()
+            .context("parsing client CA certificate PEM")?;
+        let mut client_roots = RootCertStore::empty();
+        for cert in ca_certs {
+            client_roots
+                .add(cert)
+                .context("adding client CA certificate to root store")?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(client_roots),
+            provider,
+        )
+        .build()
+        .context("building client certificate verifier")?;
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(cert_chain, key)
+            .context("building mTLS ServerConfig")?
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key)
+            .context("building ServerConfig")?
+    };
 
     Ok(config)
 }
@@ -53,17 +87,36 @@ pub fn server_tls_config(cert_path: &Path, key_path: &Path) -> Result<ServerConf
 /// - `ca_cert_path`: trust this CA for verifying the server certificate.
 ///   When `None`, the root store is empty — supply a CA cert or use `insecure`.
 /// - `insecure`: skip certificate verification entirely. **Dev/test only.**
-pub fn client_tls_config(ca_cert_path: Option<&Path>, insecure: bool) -> Result<ClientConfig> {
+/// - `client_cert_path` + `client_key_path`: when both are `Some`, the client
+///   presents this certificate to the server (mutual TLS).
+pub fn client_tls_config(
+    ca_cert_path: Option<&Path>,
+    insecure: bool,
+    client_cert_path: Option<&Path>,
+    client_key_path: Option<&Path>,
+) -> Result<ClientConfig> {
+    if client_cert_path.is_some() != client_key_path.is_some() {
+        anyhow::bail!("client_cert_path and client_key_path must both be set or both be unset");
+    }
+
     let provider = Arc::new(rustls::crypto::ring::default_provider());
 
     if insecure {
-        tracing::info!("TCP TLS: certificate verification disabled (insecure mode)");
-        let config = ClientConfig::builder_with_provider(provider)
+        tracing::info!("TLS: certificate verification disabled (insecure mode)");
+        let builder = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .context("configuring TLS protocol versions")?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(Arc::new(NoVerifier));
+        let config = match (client_cert_path, client_key_path) {
+            (Some(cp), Some(kp)) => {
+                let (chain, key) = load_client_cert(cp, kp)?;
+                builder
+                    .with_client_auth_cert(chain, key)
+                    .context("building insecure mTLS ClientConfig")?
+            }
+            _ => builder.with_no_client_auth(),
+        };
         return Ok(config);
     }
 
@@ -87,18 +140,43 @@ pub fn client_tls_config(ca_cert_path: Option<&Path>, insecure: bool) -> Result<
             );
         }
     }
-    // When no CA cert is provided, the root store is empty — the caller must
-    // supply a CA cert or use `insecure = true`. This is intentional: in
-    // cluster deployments, certs are issued by an internal CA and system roots
-    // are not relevant.
 
-    let config = ClientConfig::builder_with_provider(provider)
+    let builder = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .context("configuring TLS protocol versions")?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .with_root_certificates(root_store);
+
+    let config = match (client_cert_path, client_key_path) {
+        (Some(cp), Some(kp)) => {
+            let (chain, key) = load_client_cert(cp, kp)?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .context("building mTLS ClientConfig")?
+        }
+        _ => builder.with_no_client_auth(),
+    };
 
     Ok(config)
+}
+
+fn load_client_cert(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<(
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    let cert_pem = std::fs::read(cert_path)
+        .with_context(|| format!("reading client cert: {}", cert_path.display()))?;
+    let key_pem = std::fs::read(key_path)
+        .with_context(|| format!("reading client key: {}", key_path.display()))?;
+    let cert_chain = certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .context("parsing client certificate PEM")?;
+    let key = private_key(&mut key_pem.as_slice())
+        .context("parsing client private key PEM")?
+        .context("no private key found in client PEM")?;
+    Ok((cert_chain, key))
 }
 
 /// Certificate verifier that accepts any certificate.
@@ -167,21 +245,27 @@ mod tests {
     #[test]
     fn server_config_roundtrip() {
         let (cert, key) = make_cert_files();
-        server_tls_config(cert.path(), key.path()).unwrap();
+        server_tls_config(cert.path(), key.path(), None).unwrap();
+    }
+
+    #[test]
+    fn server_config_with_mtls() {
+        let (cert, key) = make_cert_files();
+        server_tls_config(cert.path(), key.path(), Some(cert.path())).unwrap();
     }
 
     #[test]
     fn server_config_bad_paths() {
         let missing = std::path::Path::new("/nonexistent/x.pem");
         assert!(
-            server_tls_config(missing, missing)
+            server_tls_config(missing, missing, None)
                 .unwrap_err()
                 .to_string()
                 .contains("reading cert")
         );
         let (cert, _) = make_cert_files();
         assert!(
-            server_tls_config(cert.path(), missing)
+            server_tls_config(cert.path(), missing, None)
                 .unwrap_err()
                 .to_string()
                 .contains("reading key")
@@ -190,20 +274,38 @@ mod tests {
 
     #[test]
     fn client_config_insecure() {
-        client_tls_config(None, true).unwrap();
+        client_tls_config(None, true, None, None).unwrap();
     }
 
     #[test]
     fn client_config_with_ca() {
         let (cert, _) = make_cert_files();
-        client_tls_config(Some(cert.path()), false).unwrap();
+        client_tls_config(Some(cert.path()), false, None, None).unwrap();
+    }
+
+    #[test]
+    fn client_config_with_mtls() {
+        let (cert, key) = make_cert_files();
+        client_tls_config(
+            Some(cert.path()),
+            false,
+            Some(cert.path()),
+            Some(key.path()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn client_config_partial_mtls_errors() {
+        let (cert, _) = make_cert_files();
+        assert!(client_tls_config(Some(cert.path()), false, Some(cert.path()), None).is_err());
     }
 
     #[test]
     fn client_config_empty_ca_errors() {
         let empty = NamedTempFile::new().unwrap();
         assert!(
-            client_tls_config(Some(empty.path()), false)
+            client_tls_config(Some(empty.path()), false, None, None)
                 .unwrap_err()
                 .to_string()
                 .contains("CA certificate store is empty")
@@ -213,10 +315,15 @@ mod tests {
     #[test]
     fn client_config_missing_ca_errors() {
         assert!(
-            client_tls_config(Some(std::path::Path::new("/nonexistent/ca.pem")), false)
-                .unwrap_err()
-                .to_string()
-                .contains("reading CA cert")
+            client_tls_config(
+                Some(std::path::Path::new("/nonexistent/ca.pem")),
+                false,
+                None,
+                None
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("reading CA cert")
         );
     }
 }

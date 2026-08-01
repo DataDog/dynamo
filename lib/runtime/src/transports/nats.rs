@@ -19,12 +19,14 @@
 //!
 //! ## TLS
 //!
-//! A custom TLS config is applied when `NATS_TLS_CA_CERT_PATH` is set or
-//! `NATS_TLS_INSECURE` is truthy. When only the `tls://` URL scheme is used
-//! without explicit TLS env vars, async-nats handles TLS natively with system
-//! roots.
+//! A custom TLS config is applied when `NATS_TLS_CA_CERT_PATH` is set,
+//! `NATS_TLS_INSECURE` is truthy, or client certs are configured. When only
+//! the `tls://` URL scheme is used without explicit TLS env vars, async-nats
+//! handles TLS natively with system roots.
 //!
 //! - `NATS_TLS_CA_CERT_PATH`: path to the CA cert PEM used to verify the server
+//! - `NATS_TLS_CLIENT_CERT_PATH`: client cert PEM for mutual TLS (optional)
+//! - `NATS_TLS_CLIENT_KEY_PATH`: client key PEM for mutual TLS (optional)
 //! - `NATS_TLS_INSECURE`: set to a truthy value to skip certificate verification (dev only)
 use crate::metrics::MetricsHierarchy;
 use crate::protocols::EndpointId;
@@ -291,10 +293,17 @@ pub struct ClientOptions {
     #[builder(default)]
     auth: NatsAuth,
 
-    /// Path to PEM CA certificate for TLS. When set, TLS is required and
-    /// `NATS_SERVER` must use the `tls://` scheme.
+    /// Path to PEM CA certificate for TLS.
     #[builder(default = "default_nats_tls_ca_cert_path()")]
     tls_ca_cert_path: Option<PathBuf>,
+
+    /// Path to PEM client certificate for mutual TLS (mTLS).
+    #[builder(default = "default_nats_tls_client_cert_path()")]
+    tls_client_cert_path: Option<PathBuf>,
+
+    /// Path to PEM client private key for mutual TLS (mTLS).
+    #[builder(default = "default_nats_tls_client_key_path()")]
+    tls_client_key_path: Option<PathBuf>,
 
     /// Skip TLS certificate verification. For development only.
     #[builder(default = "default_nats_tls_insecure()")]
@@ -321,6 +330,18 @@ fn validate_nats_server(server: &str) -> Result<(), ValidationError> {
 
 fn default_nats_tls_ca_cert_path() -> Option<PathBuf> {
     std::env::var(env_nats::tls::NATS_TLS_CA_CERT_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_nats_tls_client_cert_path() -> Option<PathBuf> {
+    std::env::var(env_nats::tls::NATS_TLS_CLIENT_CERT_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_nats_tls_client_key_path() -> Option<PathBuf> {
+    std::env::var(env_nats::tls::NATS_TLS_CLIENT_KEY_PATH)
         .ok()
         .map(PathBuf::from)
 }
@@ -361,15 +382,42 @@ impl ClientOptions {
             }
         };
 
-        // Apply a custom TLS config when a CA cert or insecure mode is explicitly
-        // configured. When only a tls:// URL is used without explicit TLS env vars,
-        // let async-nats handle TLS natively (it uses its own rustls setup with
-        // system roots).
-        let custom_tls = self.tls_ca_cert_path.is_some() || self.tls_insecure;
+        // Validate that client cert and key are either both set or both unset.
+        if self.tls_client_cert_path.is_some() != self.tls_client_key_path.is_some() {
+            anyhow::bail!(
+                "Both {} and {} must be set together to enable NATS mTLS",
+                env_nats::tls::NATS_TLS_CLIENT_CERT_PATH,
+                env_nats::tls::NATS_TLS_CLIENT_KEY_PATH,
+            );
+        }
+
+        // mTLS with client cert requires a CA cert to build a complete custom
+        // TLS config. Without it, the root store would be empty and server
+        // verification would fail.
+        if self.tls_client_cert_path.is_some()
+            && self.tls_ca_cert_path.is_none()
+            && !self.tls_insecure
+        {
+            anyhow::bail!(
+                "{} requires {} (or {}) to also be set",
+                env_nats::tls::NATS_TLS_CLIENT_CERT_PATH,
+                env_nats::tls::NATS_TLS_CA_CERT_PATH,
+                env_nats::tls::NATS_TLS_INSECURE,
+            );
+        }
+
+        // Apply a custom TLS config when a CA cert, insecure mode, or client
+        // cert is configured. When only a tls:// URL is used without explicit
+        // TLS env vars, let async-nats handle TLS natively with system roots.
+        let custom_tls = self.tls_ca_cert_path.is_some()
+            || self.tls_insecure
+            || self.tls_client_cert_path.is_some();
         if custom_tls {
             let tls_config = crate::tls_utils::client_tls_config(
                 self.tls_ca_cert_path.as_deref(),
                 self.tls_insecure,
+                self.tls_client_cert_path.as_deref(),
+                self.tls_client_key_path.as_deref(),
             )?;
             options = options.tls_client_config(tls_config).require_tls(true);
         } else if self.server.starts_with("tls://") {
@@ -412,6 +460,8 @@ impl Default for ClientOptions {
             server: default_server(),
             auth: NatsAuth::default(),
             tls_ca_cert_path: default_nats_tls_ca_cert_path(),
+            tls_client_cert_path: default_nats_tls_client_cert_path(),
+            tls_client_key_path: default_nats_tls_client_key_path(),
             tls_insecure: default_nats_tls_insecure(),
         }
     }
@@ -1055,6 +1105,44 @@ mod tests {
             assert!(!opts.tls_insecure);
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_nats_mtls_client_cert_without_ca_errors() {
+        Jail::expect_with(|jail| {
+            jail.set_env(env_nats::NATS_SERVER, "tls://localhost:4222");
+            jail.set_env(env_nats::tls::NATS_TLS_CLIENT_CERT_PATH, "/tmp/client.pem");
+            jail.set_env(
+                env_nats::tls::NATS_TLS_CLIENT_KEY_PATH,
+                "/tmp/client-key.pem",
+            );
+            let opts = ClientOptions::builder().build().unwrap();
+            // Client cert without CA should be detected as invalid config.
+            assert!(opts.tls_client_cert_path.is_some());
+            assert!(opts.tls_ca_cert_path.is_none());
+            assert!(!opts.tls_insecure);
+            // The actual error is raised in connect(), but we can verify
+            // the config state that will trigger it.
+            Ok(())
+        });
+    }
+
+    #[tokio::test]
+    async fn test_nats_mtls_client_cert_without_ca_connect_errors() {
+        let opts = ClientOptions::builder()
+            .server("tls://localhost:4222")
+            .tls_client_cert_path(Some(PathBuf::from("/tmp/client.pem")))
+            .tls_client_key_path(Some(PathBuf::from("/tmp/client-key.pem")))
+            .build()
+            .unwrap();
+        let result = opts.connect().await;
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("requires"),
+                "expected CA requirement error, got: {e}"
+            ),
+            Ok(_) => panic!("expected error when client cert set without CA"),
+        }
     }
 
     // Integration test for object store data operations using bincode

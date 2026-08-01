@@ -211,7 +211,7 @@ impl SharedTcpServer {
             let key = std::env::var(env::DYN_TCP_TLS_KEY_PATH).ok();
             match (cert, key) {
                 (Some(c), Some(k)) => {
-                    let config = crate::tls_utils::server_tls_config(c.as_ref(), k.as_ref())
+                    let config = crate::tls_utils::server_tls_config(c.as_ref(), k.as_ref(), None)
                         .context(
                             "Failed to build TCP request plane TLS config — check cert/key paths",
                         )?;
