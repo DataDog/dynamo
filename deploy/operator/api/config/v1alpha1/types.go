@@ -234,6 +234,10 @@ type InfrastructureConfiguration struct {
 	// certificate. When set, NATS_TLS_CA_CERT_PATH is injected into every DGD pod so clients
 	// can connect to a TLS-enabled NATS server without per-DGD configuration.
 	NATSTLSCAPath string `json:"natsTLSCAPath,omitempty"`
+	// NATSTLSClientCertPath is injected as NATS_TLS_CLIENT_CERT_PATH (client cert for NATS mTLS).
+	NATSTLSClientCertPath string `json:"natsTLSClientCertPath,omitempty"`
+	// NATSTLSClientKeyPath is injected as NATS_TLS_CLIENT_KEY_PATH (client key for NATS mTLS).
+	NATSTLSClientKeyPath string `json:"natsTLSClientKeyPath,omitempty"`
 	// TCPTLSCertPath is injected as DYN_TCP_TLS_CERT_PATH (frontend server cert).
 	TCPTLSCertPath string `json:"tcpTLSCertPath,omitempty"`
 	// TCPTLSKeyPath is injected as DYN_TCP_TLS_KEY_PATH (frontend server key).

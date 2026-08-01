@@ -136,10 +136,33 @@ spec:
 Both components need the same TLS env vars because each acts as both TCP
 server and client depending on the stream direction.
 
-> **Note:** A future PR ([#10809](https://github.com/ai-dynamo/dynamo/issues/10809))
-> will add operator-level TLS configuration via `InfrastructureConfiguration`,
-> allowing TLS to be configured once at the platform level and auto-injected
-> into all DGD pods without per-component env var setup.
+### Operator-level TLS configuration
+
+Instead of setting environment variables on each component, TLS can be
+configured once at the platform level via `InfrastructureConfiguration`.
+The operator auto-injects the corresponding env vars into all DGD pods.
+
+Set the values in the operator Helm chart:
+
+```yaml
+tcpTLSCertPath: /etc/certs/server/cert.pem
+tcpTLSKeyPath: /etc/certs/server/key.pem
+tcpTLSCAPath: /etc/certs/ca/ca.pem
+natsTLSCAPath: /etc/certs/ca/ca.pem
+```
+
+Or pass them via `--set` during `helm install`/`helm upgrade`:
+
+```bash
+helm upgrade dynamo-operator ... \
+  --set tcpTLSCertPath=/etc/certs/server/cert.pem \
+  --set tcpTLSKeyPath=/etc/certs/server/key.pem \
+  --set tcpTLSCAPath=/etc/certs/ca/ca.pem \
+  --set natsTLSCAPath=/etc/certs/ca/ca.pem
+```
+
+Per-component env vars in `podTemplate` take precedence over operator-level
+values when both are set.
 
 ## Mutual TLS (mTLS)
 
@@ -173,6 +196,18 @@ All backends via `DynamoRuntimeArgGroup`:
 --tcp-tls-client-ca-cert-path PATH   CA for TCP client cert verification (PEM)
 --nats-tls-client-cert-path PATH     NATS client certificate (PEM)
 --nats-tls-client-key-path PATH      NATS client private key (PEM)
+```
+
+### Operator-level mTLS configuration
+
+mTLS certificate paths can also be configured at the operator level:
+
+```yaml
+tcpTLSClientCertPath: /etc/certs/client/cert.pem
+tcpTLSClientKeyPath: /etc/certs/client/key.pem
+tcpTLSClientCAPath: /etc/certs/client-ca/ca.pem
+natsTLSClientCertPath: /etc/certs/client/cert.pem
+natsTLSClientKeyPath: /etc/certs/client/key.pem
 ```
 
 ## NATS TLS
