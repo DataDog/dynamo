@@ -16,6 +16,16 @@
 //! - `NATS_AUTH_CREDENTIALS_FILE`: the path to the credentials file
 //!
 //! Note: `NATS_AUTH_USERNAME` and `NATS_AUTH_PASSWORD` must be used together.
+//!
+//! ## TLS
+//!
+//! A custom TLS config is applied when `NATS_TLS_CA_CERT_PATH` is set or
+//! `NATS_TLS_INSECURE` is truthy. When only the `tls://` URL scheme is used
+//! without explicit TLS env vars, async-nats handles TLS natively with system
+//! roots.
+//!
+//! - `NATS_TLS_CA_CERT_PATH`: path to the CA cert PEM used to verify the server
+//! - `NATS_TLS_INSECURE`: set to a truthy value to skip certificate verification (dev only)
 use crate::metrics::MetricsHierarchy;
 use crate::protocols::EndpointId;
 
@@ -280,6 +290,15 @@ pub struct ClientOptions {
 
     #[builder(default)]
     auth: NatsAuth,
+
+    /// Path to PEM CA certificate for TLS. When set, TLS is required and
+    /// `NATS_SERVER` must use the `tls://` scheme.
+    #[builder(default = "default_nats_tls_ca_cert_path()")]
+    tls_ca_cert_path: Option<PathBuf>,
+
+    /// Skip TLS certificate verification. For development only.
+    #[builder(default = "default_nats_tls_insecure()")]
+    tls_insecure: bool,
 }
 
 fn default_server() -> String {
@@ -291,11 +310,23 @@ fn default_server() -> String {
 }
 
 fn validate_nats_server(server: &str) -> Result<(), ValidationError> {
-    if server.starts_with("nats://") {
+    if server.starts_with("nats://") || server.starts_with("tls://") {
         Ok(())
     } else {
-        Err(ValidationError::new("server must start with 'nats://'"))
+        Err(ValidationError::new(
+            "server must start with 'nats://' or 'tls://'",
+        ))
     }
+}
+
+fn default_nats_tls_ca_cert_path() -> Option<PathBuf> {
+    std::env::var(env_nats::tls::NATS_TLS_CA_CERT_PATH)
+        .ok()
+        .map(PathBuf::from)
+}
+
+fn default_nats_tls_insecure() -> bool {
+    crate::config::env_is_truthy(env_nats::tls::NATS_TLS_INSECURE)
 }
 
 // TODO(jthomson04): We really shouldn't be hardcoding this.
@@ -311,7 +342,15 @@ impl ClientOptions {
     pub async fn connect(self) -> Result<Client> {
         self.validate()?;
 
-        let client = match self.auth {
+        // Install the ring crypto provider as the process-level default.
+        // Both ring and aws-lc-rs are compiled in (via async-nats and kube
+        // respectively), so rustls 0.23 cannot auto-detect which to use.
+        // Without this, async-nats panics when it sees a tls:// URL and calls
+        // ClientConfig::builder() internally. Silently ignored if a provider
+        // is already installed by another code path.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let mut options = match self.auth {
             NatsAuth::UserPass(username, password) => {
                 async_nats::ConnectOptions::with_user_and_password(username, password)
             }
@@ -322,20 +361,37 @@ impl ClientOptions {
             }
         };
 
+        // Apply a custom TLS config when a CA cert or insecure mode is explicitly
+        // configured. When only a tls:// URL is used without explicit TLS env vars,
+        // let async-nats handle TLS natively (it uses its own rustls setup with
+        // system roots).
+        let custom_tls = self.tls_ca_cert_path.is_some() || self.tls_insecure;
+        if custom_tls {
+            let tls_config = crate::tls_utils::client_tls_config(
+                self.tls_ca_cert_path.as_deref(),
+                self.tls_insecure,
+            )?;
+            options = options.tls_client_config(tls_config).require_tls(true);
+        } else if self.server.starts_with("tls://") {
+            // tls:// URL implies TLS but no custom CA — async-nats will use its
+            // built-in rustls with system roots. Just require TLS on the connection.
+            options = options.require_tls(true);
+        }
+
         // 0 is treated as unset — Duration::from_secs(0) would time out every request immediately.
         let request_timeout = std::env::var(env_nats::DYN_NATS_REQUEST_TIMEOUT_SECS)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&secs| secs > 0)
             .map(time::Duration::from_secs);
-        let client = match request_timeout {
-            Some(timeout) => client.request_timeout(Some(timeout)),
-            None => client,
+        let options = match request_timeout {
+            Some(timeout) => options.request_timeout(Some(timeout)),
+            None => options,
         };
 
         let (client, _) = build_in_runtime(
             async move {
-                client
+                options
                     .connect(self.server)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to connect to NATS: {e}. Verify NATS server is running and accessible."))
@@ -355,6 +411,8 @@ impl Default for ClientOptions {
         ClientOptions {
             server: default_server(),
             auth: NatsAuth::default(),
+            tls_ca_cert_path: default_nats_tls_ca_cert_path(),
+            tls_insecure: default_nats_tls_insecure(),
         }
     }
 }
@@ -941,6 +999,60 @@ mod tests {
             assert_eq!(opts.server, "nats://localhost:6222");
             assert_eq!(opts.auth, NatsAuth::Token("token".to_string()));
 
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_client_options_tls_url_validation() {
+        // tls:// is accepted by the validator
+        assert!(validate_nats_server("tls://nats:4222").is_ok());
+        assert!(validate_nats_server("nats://nats:4222").is_ok());
+        assert!(validate_nats_server("tcp://nats:4222").is_err());
+        assert!(validate_nats_server("http://nats:4222").is_err());
+
+        // tls:// URL is preserved in options
+        Jail::expect_with(|jail| {
+            jail.set_env(env_nats::NATS_SERVER, "tls://nats:4222");
+            let opts = ClientOptions::builder().build().unwrap();
+            assert_eq!(opts.server, "tls://nats:4222");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_client_options_tls_ca_from_env() {
+        Jail::expect_with(|jail| {
+            jail.set_env(env_nats::NATS_SERVER, "tls://nats:4222");
+            jail.set_env(env_nats::tls::NATS_TLS_CA_CERT_PATH, "/etc/certs/ca.pem");
+            let opts = ClientOptions::builder().build().unwrap();
+            assert_eq!(
+                opts.tls_ca_cert_path,
+                Some(PathBuf::from("/etc/certs/ca.pem"))
+            );
+            assert!(!opts.tls_insecure);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_client_options_tls_insecure_from_env() {
+        Jail::expect_with(|jail| {
+            jail.set_env(env_nats::NATS_SERVER, "tls://nats:4222");
+            jail.set_env(env_nats::tls::NATS_TLS_INSECURE, "1");
+            let opts = ClientOptions::builder().build().unwrap();
+            assert!(opts.tls_insecure);
+            assert!(opts.tls_ca_cert_path.is_none());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_client_options_no_tls_by_default() {
+        Jail::expect_with(|_jail| {
+            let opts = ClientOptions::builder().build().unwrap();
+            assert!(opts.tls_ca_cert_path.is_none());
+            assert!(!opts.tls_insecure);
             Ok(())
         });
     }
