@@ -280,9 +280,7 @@ fn get_tls_connector() -> anyhow::Result<&'static Option<TlsConnector>> {
 fn build_tls_connector_from_env() -> anyhow::Result<Option<TlsConnector>> {
     use crate::config::environment_names::tcp_response_stream::tls as env;
     let ca_cert_path = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).ok();
-    let insecure = std::env::var(env::DYN_TCP_TLS_INSECURE)
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
+    let insecure = crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE);
     let client_cert = std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).ok();
     let client_key = std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).ok();
 
