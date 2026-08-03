@@ -1,8 +1,8 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: TCP TLS
-subtitle: Encrypt all TCP connections between frontend and workers
+title: TLS
+subtitle: Encrypt TCP and NATS traffic between Dynamo components
 ---
 
 Dynamo supports opt-in TLS encryption on all TCP transports between frontends
