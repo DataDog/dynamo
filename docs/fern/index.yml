@@ -822,6 +822,8 @@ navigation:
                     path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/dynamo-operator.md
                   - page: Service Discovery
                     path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/service-discovery.md
+                  - page: Operator TLS
+                    path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/tls.md
                   - page: Webhooks
                     path: pages/developer-guide/knowledge-base/kubernetes/kubernetes-operator/webhooks.md
                   - page: Managing Models (DynamoModel)
