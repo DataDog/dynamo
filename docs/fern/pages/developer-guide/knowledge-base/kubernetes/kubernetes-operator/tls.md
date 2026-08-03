@@ -1,146 +1,21 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: TLS
-subtitle: Encrypt TCP and NATS traffic between Dynamo components
+title: Operator TLS
+subtitle: Configure TLS once at the platform level and auto-inject it into every deployment
 ---
 
-Dynamo supports opt-in TLS encryption on all TCP transports between frontends
-and workers. When enabled, both the **request plane** (frontend → worker
-inference requests) and the **response stream** (worker → frontend inference
-output) are encrypted using [rustls](https://github.com/rustls/rustls) with the
-`ring` cryptographic provider. When no TLS configuration is provided, all
-transports operate in plaintext exactly as before.
+The Dynamo operator can inject TLS configuration into every
+`DynamoGraphDeployment` (DGD) pod automatically, so you don't have to set the
+`DYN_TCP_TLS_*` and `NATS_TLS_*` environment variables on each component. TLS
+is configured once at the platform level via `InfrastructureConfiguration`, and
+the operator propagates the corresponding env vars to all DGD pods it manages.
 
-The same `DYN_TCP_TLS_*` environment variables apply to both transports — a
-single set of certificates encrypts all TCP traffic between Dynamo components.
+For the full list of TLS/mTLS environment variables and CLI flags, and for the
+per-component configuration method, see the
+[TLS reference](../reference/components/tls-configuration.mdx).
 
-> **Note:** The shared TCP request plane (`egress/tcp_client` and
-> `ingress/shared_tcp_endpoint`) is a separate transport path not yet covered
-> by this TLS implementation. This is planned for a future PR.
-
-## Environment variables
-
-All TLS configuration is driven by environment variables. The Rust runtime
-reads these directly at first connection (lazy initialization).
-
-Both frontends and workers act as TCP server and client depending on the
-stream direction (response streams: worker dials frontend; request streams:
-frontend dials worker). All TLS env vars should be set on every pod.
-
-### Server role (accepting connections)
-
-| Variable | Description |
-|---|---|
-| `DYN_TCP_TLS_CERT_PATH` | Path to the PEM certificate file. When set together with `DYN_TCP_TLS_KEY_PATH`, TLS is enabled on the TCP server. |
-| `DYN_TCP_TLS_KEY_PATH` | Path to the PEM private key for the server certificate. |
-
-### Client role (dialing connections)
-
-| Variable | Description |
-|---|---|
-| `DYN_TCP_TLS_CA_CERT_PATH` | Path to the PEM CA certificate used to verify the peer's server certificate. |
-| `DYN_TCP_TLS_INSECURE` | Set to `1` or `true` to skip certificate verification. For local development only. |
-| `DYN_TCP_TLS_SERVER_NAME` | Override the TLS SNI hostname. Useful when connecting by IP to a server whose certificate has a DNS SAN. |
-| `DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS` | TLS handshake timeout in seconds (default: 3). |
-
-## CLI flags
-
-The same configuration is available via command-line flags on all backends
-(vllm, sglang, trtllm, tokenspeed) through `DynamoRuntimeArgGroup`:
-
-```
---tcp-tls-cert-path PATH      Server certificate (PEM)
---tcp-tls-key-path PATH       Server private key (PEM)
---tcp-tls-ca-cert-path PATH   CA certificate for server verification (PEM)
---tcp-tls-insecure             Disable certificate verification
---tcp-tls-server-name NAME     Override TLS SNI hostname
---tcp-tls-handshake-timeout N  Handshake timeout in seconds (default: 3)
-```
-
-The frontend (`dynamo.frontend`) also accepts `--tcp-tls-cert-path`,
-`--tcp-tls-key-path`, and `--tcp-tls-ca-cert-path`.
-
-## Quick start
-
-Generate a self-signed certificate for local testing:
-
-```bash
-# Generate CA
-openssl req -x509 -newkey rsa:2048 -keyout ca-key.pem -out ca-cert.pem \
-  -days 365 -nodes -subj "/CN=DynamoCA"
-
-# Generate server cert with SAN
-openssl req -newkey rsa:2048 -keyout server-key.pem -out server-csr.pem \
-  -nodes -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-
-openssl x509 -req -in server-csr.pem -CA ca-cert.pem -CAkey ca-key.pem \
-  -CAcreateserial -out server-cert.pem -days 365 -copy_extensions copyall
-```
-
-Both frontend and worker need the same flags (both act as server and client):
-
-```bash
-python -m dynamo.vllm \
-  --tcp-tls-cert-path server-cert.pem \
-  --tcp-tls-key-path server-key.pem \
-  --tcp-tls-ca-cert-path ca-cert.pem \
-  --tcp-tls-server-name localhost \
-  ...
-
-python -m dynamo.frontend \
-  --tcp-tls-cert-path server-cert.pem \
-  --tcp-tls-key-path server-key.pem \
-  --tcp-tls-ca-cert-path ca-cert.pem \
-  --tcp-tls-server-name localhost \
-  ...
-```
-
-## Kubernetes deployment
-
-In Kubernetes, TLS certificates are typically delivered by a certificate
-management system (e.g., cert-manager) and mounted into pods. Set the
-environment variables on each component's pod template in the
-`DynamoGraphDeployment` spec:
-
-```yaml
-spec:
-  components:
-  - name: Frontend
-    podTemplate:
-      spec:
-        containers:
-        - name: main
-          env:
-          - name: DYN_TCP_TLS_CERT_PATH
-            value: /etc/certs/server/cert.pem
-          - name: DYN_TCP_TLS_KEY_PATH
-            value: /etc/certs/server/key.pem
-          - name: DYN_TCP_TLS_CA_CERT_PATH
-            value: /etc/certs/ca/ca.pem
-  - name: VllmWorker
-    podTemplate:
-      spec:
-        containers:
-        - name: main
-          env:
-          - name: DYN_TCP_TLS_CERT_PATH
-            value: /etc/certs/server/cert.pem
-          - name: DYN_TCP_TLS_KEY_PATH
-            value: /etc/certs/server/key.pem
-          - name: DYN_TCP_TLS_CA_CERT_PATH
-            value: /etc/certs/ca/ca.pem
-```
-
-Both components need the same TLS env vars because each acts as both TCP
-server and client depending on the stream direction.
-
-### Operator-level TLS configuration
-
-Instead of setting environment variables on each component, TLS can be
-configured once at the platform level via `InfrastructureConfiguration`.
-The operator auto-injects the corresponding env vars into all DGD pods.
+## Operator-level TLS configuration
 
 Set the values in the operator Helm chart:
 
@@ -164,41 +39,7 @@ helm upgrade dynamo-operator ... \
 Per-component env vars in `podTemplate` take precedence over operator-level
 values when both are set.
 
-## Mutual TLS (mTLS)
-
-mTLS adds client certificate authentication on top of TLS. The server verifies
-the client's identity before accepting the connection.
-
-### TCP mTLS
-
-| Variable | Description |
-|---|---|
-| `DYN_TCP_TLS_CLIENT_CERT_PATH` | Client certificate presented to the TCP server. |
-| `DYN_TCP_TLS_CLIENT_KEY_PATH` | Private key for the client certificate. |
-| `DYN_TCP_TLS_CLIENT_CA_CERT_PATH` | CA certificate the server uses to verify client certificates. When set, clients must present a valid certificate. |
-
-### NATS mTLS
-
-| Variable | Description |
-|---|---|
-| `NATS_TLS_CLIENT_CERT_PATH` | Client certificate presented to the NATS server. Must be set with `NATS_TLS_CLIENT_KEY_PATH`. |
-| `NATS_TLS_CLIENT_KEY_PATH` | Private key for the NATS client certificate. |
-
-NATS mTLS requires `NATS_TLS_CA_CERT_PATH` to also be set.
-
-### mTLS CLI flags
-
-All backends via `DynamoRuntimeArgGroup`:
-
-```
---tcp-tls-client-cert-path PATH      TCP client certificate (PEM)
---tcp-tls-client-key-path PATH       TCP client private key (PEM)
---tcp-tls-client-ca-cert-path PATH   CA for TCP client cert verification (PEM)
---nats-tls-client-cert-path PATH     NATS client certificate (PEM)
---nats-tls-client-key-path PATH      NATS client private key (PEM)
-```
-
-### Operator-level mTLS configuration
+## Operator-level mTLS configuration
 
 mTLS certificate paths can also be configured at the operator level:
 
@@ -210,49 +51,6 @@ natsTLSClientCertPath: /etc/certs/client/cert.pem
 natsTLSClientKeyPath: /etc/certs/client/key.pem
 ```
 
-## NATS TLS
-
-NATS is used for JetStream indexer recovery/replay and the audit sink. TLS
-is configured separately from TCP:
-
-| Variable | Description |
-|---|---|
-| `NATS_TLS_CA_CERT_PATH` | CA certificate to verify the NATS server. When set, a custom TLS config is applied. |
-| `NATS_TLS_INSECURE` | Skip NATS server certificate verification (dev only). |
-
-When only the `tls://` URL scheme is used without explicit TLS env vars,
-async-nats handles TLS natively with system roots.
-
-The `NATS_SERVER` URL accepts both `nats://` and `tls://` schemes.
-
-CLI flags (all backends via `DynamoRuntimeArgGroup`):
-
-```
---nats-tls-ca-cert-path PATH   CA certificate for NATS server verification (PEM)
---nats-tls-insecure             Disable NATS certificate verification
-```
-
-## Encrypted paths
-
-When TLS is configured, all communication between Dynamo components is
-encrypted:
-
-| Path | Direction | Data | Transport |
-|---|---|---|---|
-| Request plane | Frontend → Worker | User prompts, request metadata | `egress/tcp_client` → `ingress/shared_tcp_endpoint` |
-| Response stream | Worker → Frontend | Inference output tokens | `tcp/client` → `tcp/server` |
-| Request stream | Frontend → Worker | Streaming input (bidirectional) | `tcp/client` → `tcp/server` |
-| NATS | Frontend/Worker ↔ NATS | JetStream recovery, audit logs | `transports/nats` |
-
-## Design notes
-
-- TLS configuration is cached after the first connection via `OnceCell`.
-  Certificate rotation requires a process restart.
-- The TLS handshake is spawned per-connection on both the request plane and
-  response stream servers so the accept loop is never blocked.
-- Invalid TLS configuration on the request plane (e.g. bad cert path) prevents
-  server startup rather than silently falling back to plaintext.
-- When server and client TLS configurations are mismatched (e.g., server has TLS
-  but client does not), a warning is logged at startup.
-- An empty CA certificate file is detected at load time and rejected with a
-  clear error message.
+The certificates themselves are typically delivered by a certificate management
+system (e.g., cert-manager) and mounted into the pods at the paths referenced
+above.
