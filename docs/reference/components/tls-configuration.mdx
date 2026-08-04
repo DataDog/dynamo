@@ -15,10 +15,6 @@ transports operate in plaintext exactly as before.
 The same `DYN_TCP_TLS_*` environment variables apply to both transports — a
 single set of certificates encrypts all TCP traffic between Dynamo components.
 
-> **Note:** The shared TCP request plane (`egress/tcp_client` and
-> `ingress/shared_tcp_endpoint`) is a separate transport path not yet covered
-> by this TLS implementation. This is planned for a future PR.
-
 ## Environment variables
 
 All TLS configuration is driven by environment variables. The Rust runtime
