@@ -389,15 +389,26 @@ fn get_request_plane_tls_connector() -> anyhow::Result<&'static Option<TlsConnec
         use crate::config::environment_names::tcp_response_stream::tls as env;
         let ca_cert_path = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).ok();
         let insecure = crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE);
-        let tls_requested = ca_cert_path.is_some() || insecure;
+        let client_cert = std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).ok();
+        let client_key = std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).ok();
+        let tls_requested =
+            ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
         if !tls_requested {
             return Ok(None);
+        }
+        if !insecure && ca_cert_path.is_none() {
+            anyhow::bail!(
+                "Request plane TLS is enabled but {} is not set and {} is not true; \
+                 provide a CA cert or set insecure mode for development",
+                env::DYN_TCP_TLS_CA_CERT_PATH,
+                env::DYN_TCP_TLS_INSECURE,
+            );
         }
         let tls_config = crate::tls_utils::client_tls_config(
             ca_cert_path.as_deref().map(std::path::Path::new),
             insecure,
-            None,
-            None,
+            client_cert.as_deref().map(std::path::Path::new),
+            client_key.as_deref().map(std::path::Path::new),
         )?;
         Ok(Some(TlsConnector::from(std::sync::Arc::new(tls_config))))
     })
