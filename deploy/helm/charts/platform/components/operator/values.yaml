@@ -149,6 +149,10 @@ natsAddr: ""
 # natsTLSCAPath: auto-inject NATS_TLS_CA_CERT_PATH into every DGD pod.
 # Example (emissary filemode): /etc/emissary/certs/server/ca.pem
 natsTLSCAPath: ""
+# natsTLSClientCertPath / natsTLSClientKeyPath: auto-inject NATS_TLS_CLIENT_CERT_PATH
+# and NATS_TLS_CLIENT_KEY_PATH into every DGD pod for NATS mTLS.
+natsTLSClientCertPath: ""
+natsTLSClientKeyPath: ""
 # TCP request-plane TLS — auto-inject DYN_TCP_TLS_* into every DGD pod.
 # Requires a TLS-capable dynamo-vllm-runtime image.
 tcpTLSCertPath: ""

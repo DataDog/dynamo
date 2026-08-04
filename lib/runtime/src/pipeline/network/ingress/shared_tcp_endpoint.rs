@@ -14,7 +14,7 @@ use crate::metrics::work_handler_pool::{
     WORK_HANDLER_QUEUE_DEPTH,
 };
 use crate::pipeline::network::PushWorkHandler;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
@@ -22,8 +22,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+
+type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::bytes::BytesMut;
 use tokio_util::sync::CancellationToken;
@@ -150,6 +154,8 @@ pub struct SharedTcpServer {
     /// Overflow-queue capacity; `read_loop` compares against it to tell whether
     /// the queue is empty for the FIFO direct-dispatch rule.
     queue_capacity: usize,
+    /// Optional TLS acceptor for encrypting request plane connections.
+    tls_acceptor: Option<Arc<TlsAcceptor>>,
 }
 
 struct EndpointHandler {
@@ -164,7 +170,10 @@ struct EndpointHandler {
 }
 
 impl SharedTcpServer {
-    pub fn new(bind_addr: SocketAddr, cancellation_token: CancellationToken) -> Arc<Self> {
+    pub fn new(
+        bind_addr: SocketAddr,
+        cancellation_token: CancellationToken,
+    ) -> anyhow::Result<Arc<Self>> {
         let SizingConfig {
             pool_size: worker_pool_size,
             queue_size: work_queue_size,
@@ -195,17 +204,41 @@ impl SharedTcpServer {
         // Dispatcher drains the overflow queue.
         Self::start_worker_pool(engine_sem.clone(), work_rx, cancellation_token.clone());
 
-        Arc::new(Self {
+        // Build TLS acceptor from the same env vars as the call-home transport.
+        let tls_acceptor = {
+            use crate::config::environment_names::tcp_response_stream::tls as env;
+            let cert = std::env::var(env::DYN_TCP_TLS_CERT_PATH).ok();
+            let key = std::env::var(env::DYN_TCP_TLS_KEY_PATH).ok();
+            match (cert, key) {
+                (Some(c), Some(k)) => {
+                    let config = crate::tls_utils::server_tls_config(c.as_ref(), k.as_ref(), None)
+                        .context(
+                            "Failed to build TCP request plane TLS config — check cert/key paths",
+                        )?;
+                    tracing::info!("TCP request plane: TLS enabled");
+                    Some(Arc::new(TlsAcceptor::from(Arc::new(config))))
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    anyhow::bail!(
+                        "Both {} and {} must be set to enable TCP request plane TLS",
+                        env::DYN_TCP_TLS_CERT_PATH,
+                        env::DYN_TCP_TLS_KEY_PATH,
+                    );
+                }
+                (None, None) => None,
+            }
+        };
+
+        Ok(Arc::new(Self {
             handlers: Arc::new(DashMap::new()),
-            // address we requested to bind to.
             bind_addr,
-            // actual address after free port assignment (if DYN_TCP_RPC_PORT is not specified)
             actual_addr: RwLock::new(None),
             cancellation_token,
             work_tx,
             engine_sem,
             queue_capacity: work_queue_size,
-        })
+            tls_acceptor,
+        }))
     }
 
     /// Start the worker pool dispatcher that processes requests with bounded concurrency
@@ -395,8 +428,38 @@ impl SharedTcpServer {
                             let work_tx = self.work_tx.clone();
                             let engine_sem = self.engine_sem.clone();
                             let queue_capacity = self.queue_capacity;
+                            let tls_acceptor = self.tls_acceptor.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(stream, handlers, work_tx, engine_sem, queue_capacity).await {
+                                let (reader, writer): (BoxRead, BoxWrite) =
+                                    if let Some(ref tls) = tls_acceptor {
+                                        match tokio::time::timeout(
+                                            crate::tls_utils::handshake_timeout(),
+                                            tls.accept(stream),
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(tls_stream)) => {
+                                                let (r, w) = tokio::io::split(tls_stream);
+                                                (Box::new(r), Box::new(w))
+                                            }
+                                            Ok(Err(e)) => {
+                                                tracing::warn!(
+                                                    "Request plane TLS handshake failed from {peer_addr}: {e}"
+                                                );
+                                                return;
+                                            }
+                                            Err(_) => {
+                                                tracing::warn!(
+                                                    "Request plane TLS handshake timed out from {peer_addr}"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        let (r, w) = tokio::io::split(stream);
+                                        (Box::new(r), Box::new(w))
+                                    };
+                                if let Err(e) = Self::handle_connection(reader, writer, handlers, work_tx, engine_sem, queue_capacity).await {
                                     tracing::error!("TCP connection error: {e}");
                                 }
                             });
@@ -494,16 +557,14 @@ impl SharedTcpServer {
     }
 
     async fn handle_connection(
-        stream: TcpStream,
+        read_half: BoxRead,
+        write_half: BoxWrite,
         handlers: Arc<DashMap<String, Arc<EndpointHandler>>>,
         work_tx: tokio::sync::mpsc::Sender<WorkItem>,
         engine_sem: Arc<Semaphore>,
         queue_capacity: usize,
     ) -> Result<()> {
         use crate::pipeline::network::codec::{TcpRequestMessage, TcpResponseMessage};
-
-        // Split stream into read and write halves for concurrent operations
-        let (read_half, write_half) = tokio::io::split(stream);
 
         // Channel for sending responses to the write task (zero-copy Bytes)
         let (response_tx, response_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -530,7 +591,7 @@ impl SharedTcpServer {
 
     #[allow(clippy::too_many_arguments)]
     async fn read_loop(
-        mut read_half: tokio::io::ReadHalf<TcpStream>,
+        mut read_half: BoxRead,
         handlers: Arc<DashMap<String, Arc<EndpointHandler>>>,
         response_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
         work_tx: tokio::sync::mpsc::Sender<WorkItem>,
@@ -696,7 +757,7 @@ impl SharedTcpServer {
     }
 
     async fn write_loop(
-        mut write_half: tokio::io::WriteHalf<TcpStream>,
+        mut write_half: BoxWrite,
         mut response_rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     ) -> Result<()> {
         while let Some(response) = response_rx.recv().await {
@@ -844,7 +905,7 @@ mod tests {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
         // Create SharedTcpServer
-        let server = SharedTcpServer::new(bind_addr, cancellation_token.clone());
+        let server = SharedTcpServer::new(bind_addr, cancellation_token.clone()).unwrap();
 
         // Create a handler that takes 1s to process requests
         let handler = Arc::new(SlowMockHandler::new(Duration::from_secs(1)));
@@ -1195,7 +1256,7 @@ mod tests {
         // a SharedTcpServer will have populated the gauges; we just assert they're > 0.
         let cancellation_token = CancellationToken::new();
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let _server = SharedTcpServer::new(bind_addr, cancellation_token.clone());
+        let _server = SharedTcpServer::new(bind_addr, cancellation_token.clone()).unwrap();
 
         assert!(
             WORK_HANDLER_POOL_CAPACITY.get() > 0,

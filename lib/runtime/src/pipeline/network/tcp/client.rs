@@ -72,10 +72,13 @@ impl TcpClient {
         let stream = TcpClient::connect(address).await?;
         if let Some(connector) = get_tls_connector()? {
             let server_name = tls_server_name(address)?;
-            let tls_stream = connector
-                .connect(server_name, stream)
-                .await
-                .with_context(|| format!("TLS handshake failed connecting to {address}"))?;
+            let tls_stream = tokio::time::timeout(
+                crate::tls_utils::handshake_timeout(),
+                connector.connect(server_name, stream),
+            )
+            .await
+            .with_context(|| format!("TLS handshake timed out connecting to {address}"))?
+            .with_context(|| format!("TLS handshake failed connecting to {address}"))?;
             let (r, w) = tokio::io::split(tls_stream);
             Ok((Box::new(r), Box::new(w)))
         } else {
@@ -257,8 +260,12 @@ impl TcpClient {
     }
 }
 
-/// Cached TCP TLS connector — built once from env vars, reused for every connection.
-/// `None` means plaintext; `Some(connector)` means TLS/mTLS.
+/// Cached TCP TLS connector — built once from env vars on first TCP connection, reused for every
+/// subsequent connection. `None` means plaintext; `Some(connector)` means TLS/mTLS.
+///
+/// The config is intentionally immutable after the first build: `rustls::ClientConfig` is
+/// cheaply `Arc`-cloned per-connection, so sharing it is free. Cert rotation requires a process
+/// restart; this is consistent with how most services handle TLS credential updates.
 static TCP_TLS_CONNECTOR: once_cell::sync::OnceCell<Option<TlsConnector>> =
     once_cell::sync::OnceCell::new();
 
@@ -273,24 +280,26 @@ fn get_tls_connector() -> anyhow::Result<&'static Option<TlsConnector>> {
 fn build_tls_connector_from_env() -> anyhow::Result<Option<TlsConnector>> {
     use crate::config::environment_names::tcp_response_stream::tls as env;
     let ca_cert_path = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).ok();
-    let insecure = std::env::var(env::DYN_TCP_TLS_INSECURE)
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let insecure = crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE);
     let client_cert = std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).ok();
     let client_key = std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).ok();
 
-    // Fail fast on partial mTLS client config.
-    if client_cert.is_some() != client_key.is_some() {
-        anyhow::bail!(
-            "Both {} and {} must be set together to enable TCP mTLS",
-            env::DYN_TCP_TLS_CLIENT_CERT_PATH,
-            env::DYN_TCP_TLS_CLIENT_KEY_PATH,
-        );
-    }
-
     // Any TLS env var set → TLS is intended; missing CA without insecure is an error.
-    let tls_requested = ca_cert_path.is_some() || insecure || client_cert.is_some();
+    // Partial mTLS config (cert without key or vice versa) is rejected downstream
+    // by `tls_utils::client_tls_config`.
+    let tls_requested =
+        ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
     if !tls_requested {
+        let server_tls_set = std::env::var(env::DYN_TCP_TLS_CERT_PATH).is_ok();
+        if server_tls_set {
+            tracing::warn!(
+                "TCP client is running in plaintext mode but {} is set. \
+                 Set {} (or {} for dev) to enable client-side TLS.",
+                env::DYN_TCP_TLS_CERT_PATH,
+                env::DYN_TCP_TLS_CA_CERT_PATH,
+                env::DYN_TCP_TLS_INSECURE,
+            );
+        }
         return Ok(None);
     }
     if !insecure && ca_cert_path.is_none() {
@@ -1900,6 +1909,78 @@ mod tests {
             counter.get(),
             0,
             "consumer drop must not count as cancellation"
+        );
+    }
+
+    // ── TLS connector and SNI tests ──────────────────────────────────────────
+
+    fn make_ca_file() -> tempfile::NamedTempFile {
+        use std::io::Write;
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(cert.pem().as_bytes()).unwrap();
+        f
+    }
+
+    #[test]
+    fn connector_no_env_vars_is_plaintext() {
+        temp_env::with_vars_unset(["DYN_TCP_TLS_CA_CERT_PATH", "DYN_TCP_TLS_INSECURE"], || {
+            assert!(build_tls_connector_from_env().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn connector_insecure_is_tls() {
+        temp_env::with_vars(
+            [
+                ("DYN_TCP_TLS_INSECURE", Some("true")),
+                ("DYN_TCP_TLS_CA_CERT_PATH", None),
+            ],
+            || assert!(build_tls_connector_from_env().unwrap().is_some()),
+        );
+    }
+
+    #[test]
+    fn connector_with_ca_is_tls() {
+        let ca = make_ca_file();
+        temp_env::with_vars(
+            [(
+                "DYN_TCP_TLS_CA_CERT_PATH",
+                Some(ca.path().to_str().unwrap()),
+            )],
+            || assert!(build_tls_connector_from_env().unwrap().is_some()),
+        );
+    }
+
+    #[test]
+    fn sni_parsing() {
+        temp_env::with_var_unset("DYN_TCP_TLS_SERVER_NAME", || {
+            assert!(matches!(
+                tls_server_name("127.0.0.1:8080").unwrap(),
+                ServerName::IpAddress(_)
+            ));
+            assert!(matches!(
+                tls_server_name("worker-0.dynamo-system.svc.cluster.local:8080").unwrap(),
+                ServerName::DnsName(_)
+            ));
+            assert!(matches!(
+                tls_server_name("[::1]:8080").unwrap(),
+                ServerName::IpAddress(_)
+            ));
+        });
+        temp_env::with_var(
+            "DYN_TCP_TLS_SERVER_NAME",
+            Some("my-server.example.com"),
+            || {
+                assert!(matches!(
+                    tls_server_name("127.0.0.1:8080").unwrap(),
+                    ServerName::DnsName(_)
+                ));
+            },
         );
     }
 }

@@ -186,7 +186,7 @@ pub mod nats {
         /// Must be set together with NATS_TLS_CLIENT_CERT_PATH.
         pub const NATS_TLS_CLIENT_KEY_PATH: &str = "NATS_TLS_CLIENT_KEY_PATH";
 
-        /// Disable TLS certificate verification. Set to "true" to skip verification.
+        /// Disable TLS certificate verification. Set to a truthy value to skip.
         /// WARNING: Only for local development. Never use in production.
         pub const NATS_TLS_INSECURE: &str = "NATS_TLS_INSECURE";
     }
@@ -612,6 +612,9 @@ pub mod tcp_response_stream {
         /// Path to the PEM CA certificate used by the TCP server to verify client certificates.
         /// When set, the server requires clients to present a valid certificate (mTLS).
         pub const DYN_TCP_TLS_CLIENT_CA_CERT_PATH: &str = "DYN_TCP_TLS_CLIENT_CA_CERT_PATH";
+
+        /// TLS handshake timeout in seconds (default: 3).
+        pub const DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS: &str = "DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS";
     }
 }
 
@@ -763,6 +766,10 @@ mod tests {
             nats::auth::NATS_AUTH_NKEY,
             nats::auth::NATS_AUTH_CREDENTIALS_FILE,
             nats::stream::DYN_NATS_STREAM_MAX_AGE,
+            nats::tls::NATS_TLS_CA_CERT_PATH,
+            nats::tls::NATS_TLS_CLIENT_CERT_PATH,
+            nats::tls::NATS_TLS_CLIENT_KEY_PATH,
+            nats::tls::NATS_TLS_INSECURE,
             // ETCD
             etcd::ETCD_ENDPOINTS,
             etcd::ETCD_LEASE_TTL,
@@ -848,6 +855,15 @@ mod tests {
             // TCP Response Stream
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_PORT,
             tcp_response_stream::DYN_TCP_RESPONSE_STREAM_HOST,
+            tcp_response_stream::tls::DYN_TCP_TLS_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_KEY_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CA_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_INSECURE,
+            tcp_response_stream::tls::DYN_TCP_TLS_SERVER_NAME,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_KEY_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_CLIENT_CA_CERT_PATH,
+            tcp_response_stream::tls::DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS,
             // Event Plane
             event_plane::DYN_EVENT_PLANE,
             event_plane::DYN_EVENT_PLANE_CODEC,

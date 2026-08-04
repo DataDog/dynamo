@@ -51,6 +51,8 @@ navigation:
             path: reference/support-matrix.md
           - page: Feature Matrix
             path: reference/feature-matrix.md
+          - page: TLS Configuration
+            path: reference/components/tls-configuration.mdx
           - page: Release Artifacts
             path: reference/release-artifacts.md
           - page: Examples
@@ -179,6 +181,8 @@ navigation:
             contents:
               - page: Service Discovery
                 path: kubernetes/service-discovery.md
+              - page: Operator TLS
+                path: kubernetes/tls.md
               - page: Webhooks
                 path: kubernetes/webhooks.md
               - page: Snapshotting GPU Workers

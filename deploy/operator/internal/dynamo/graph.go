@@ -1415,6 +1415,20 @@ func AddStandardEnvVars(container *corev1.Container, operatorConfig *configv1alp
 		})
 	}
 
+	if operatorConfig.Infrastructure.NATSTLSClientCertPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "NATS_TLS_CLIENT_CERT_PATH",
+			Value: operatorConfig.Infrastructure.NATSTLSClientCertPath,
+		})
+	}
+
+	if operatorConfig.Infrastructure.NATSTLSClientKeyPath != "" {
+		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
+			Name:  "NATS_TLS_CLIENT_KEY_PATH",
+			Value: operatorConfig.Infrastructure.NATSTLSClientKeyPath,
+		})
+	}
+
 	if operatorConfig.Infrastructure.TCPTLSCertPath != "" {
 		standardEnvVars = append(standardEnvVars, corev1.EnvVar{
 			Name:  "DYN_TCP_TLS_CERT_PATH",
