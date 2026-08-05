@@ -894,6 +894,38 @@ mod tests {
         assert!(format!("{error:#}").contains("reading client CA cert"));
     }
 
+    #[test]
+    fn request_plane_tls_acceptor_enables_mtls() {
+        let (cert, key) = make_cert_files();
+
+        assert!(
+            SharedTcpServer::request_plane_tls_acceptor(
+                Some(cert.path()),
+                Some(key.path()),
+                Some(cert.path()),
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn request_plane_tls_rejects_client_ca_without_server_identity() {
+        let (client_ca, _) = make_cert_files();
+
+        let error = SharedTcpServer::request_plane_tls_acceptor(
+            None,
+            None,
+            Some(client_ca.path()),
+        )
+        .err()
+        .expect("a client CA without a server certificate/key must fail");
+
+        assert!(error
+            .to_string()
+            .contains("DYN_TCP_TLS_CLIENT_CA_CERT_PATH requires"));
+    }
+
     /// Mock handler that simulates slow request processing for testing
     struct SlowMockHandler {
         /// Tracks if a request is currently being processed
