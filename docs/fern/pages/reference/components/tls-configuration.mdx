@@ -13,11 +13,11 @@ frontend inference output) are encrypted using
 provider. When no TLS configuration is provided, these streams operate in
 plaintext exactly as before.
 
-The same `DYN_TCP_TLS_*` environment variables apply to both transports — a
-single set of certificates encrypts the frontend↔worker TCP request and
-response streams. This does **not** cover the KV event plane, which is carried
-over ZMQ or NATS Core depending on setup and is a separate transport; those
-paths are not encrypted by this configuration.
+The `DYN_TCP_TLS_*` environment variables encrypt the frontend↔worker TCP
+request and response streams; NATS traffic is encrypted separately via NATS TLS
+(see the NATS TLS section below). The KV event plane is a separate transport:
+when it runs over ZMQ it is **not** encrypted, and when it runs over NATS it is
+encrypted only if NATS TLS is configured.
 
 ## Environment variables
 
@@ -165,8 +165,8 @@ CLI flags (all backends via `DynamoRuntimeArgGroup`):
 
 ## Encrypted paths
 
-When TLS is configured, all communication between Dynamo components is
-encrypted:
+When TLS is configured, the following transports are encrypted (the ZMQ event
+plane is not covered):
 
 | Path | Direction | Data | Transport |
 |---|---|---|---|
