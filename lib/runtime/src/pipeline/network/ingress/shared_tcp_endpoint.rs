@@ -214,6 +214,20 @@ impl SharedTcpServer {
             key.as_deref().map(std::path::Path::new),
             client_ca.as_deref().map(std::path::Path::new),
         )?;
+        if tls_acceptor.is_none() {
+            let client_tls_set = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).is_ok()
+                || crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE)
+                || std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).is_ok()
+                || std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).is_ok();
+            if client_tls_set {
+                tracing::warn!(
+                    "Request plane TCP server is running in plaintext mode but client TLS env vars are set. \
+                     Set {} and {} to enable server-side TLS, or unset client TLS vars.",
+                    env::DYN_TCP_TLS_CERT_PATH,
+                    env::DYN_TCP_TLS_KEY_PATH,
+                );
+            }
+        }
 
         Ok(Arc::new(Self {
             handlers: Arc::new(DashMap::new()),
