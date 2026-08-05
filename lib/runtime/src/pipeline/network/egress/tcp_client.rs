@@ -1675,8 +1675,24 @@ mod tests {
             },
         );
 
-        assert!(server_result.is_err());
-        assert!(client_result.is_err());
+        // Enforcement is server-side: rustls reports NoCertificatesPresented.
+        // Client connect() may still return Ok because the client handshake can
+        // finish before the server's fatal alert is observed.
+        assert!(
+            server_result.is_err(),
+            "server must reject a client that presents no certificate: {server_result:?}"
+        );
+        match client_result {
+            Ok(mut stream) => {
+                let mut buf = [0u8; 1];
+                let read = stream.read(&mut buf).await;
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "post-reject client I/O must fail or EOF, got {read:?}"
+                );
+            }
+            Err(_) => {}
+        }
     }
 
     #[test]
