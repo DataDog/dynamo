@@ -583,6 +583,14 @@ impl TcpConnection {
                     }
                     return Err(e.into());
                 }
+                if let Err(e) = write_half.flush().await {
+                    send_buf.clear();
+                    let err_msg = format!("Flush failed: {e}");
+                    for tx in response_batch.drain(..) {
+                        let _ = tx.send(Err(anyhow::anyhow!("{}", err_msg)));
+                    }
+                    return Err(e.into());
+                }
                 TCP_BYTES_SENT_TOTAL.inc_by(send_buf.len() as f64);
                 send_buf.clear(); // reset length, keep allocation for next batch
 
@@ -1549,7 +1557,8 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tempfile::NamedTempFile;
     use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
 
     fn make_cert_files() -> (NamedTempFile, NamedTempFile) {
         let key_pair = rcgen::KeyPair::generate().unwrap();
@@ -1598,6 +1607,76 @@ mod tests {
         assert!(error
             .to_string()
             .contains("DYN_TCP_TLS_CA_CERT_PATH is not set"));
+    }
+
+    #[tokio::test]
+    async fn request_plane_mtls_handshake_requires_client_identity() {
+        let (cert, key) = make_cert_files();
+        let server_config =
+            crate::tls_utils::server_tls_config(cert.path(), key.path(), Some(cert.path()))
+                .unwrap();
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let connector = build_request_plane_tls_connector(
+            Some(cert.path()),
+            false,
+            Some(cert.path()),
+            Some(key.path()),
+        )
+        .unwrap()
+        .unwrap();
+        let (server_result, client_result) = tokio::join!(
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                acceptor.accept(stream).await
+            },
+            async {
+                connector
+                    .connect(
+                        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                        TcpStream::connect(address).await.unwrap(),
+                    )
+                    .await
+            },
+        );
+
+        assert!(server_result.is_ok());
+        assert!(client_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_plane_mtls_rejects_client_without_identity() {
+        let (cert, key) = make_cert_files();
+        let server_config =
+            crate::tls_utils::server_tls_config(cert.path(), key.path(), Some(cert.path()))
+                .unwrap();
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let connector =
+            build_request_plane_tls_connector(Some(cert.path()), false, None, None)
+                .unwrap()
+                .unwrap();
+        let (server_result, client_result) = tokio::join!(
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                acceptor.accept(stream).await
+            },
+            async {
+                connector
+                    .connect(
+                        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                        TcpStream::connect(address).await.unwrap(),
+                    )
+                    .await
+            },
+        );
+
+        assert!(server_result.is_err());
+        assert!(client_result.is_err());
     }
 
     #[test]
