@@ -205,29 +205,29 @@ impl SharedTcpServer {
         Self::start_worker_pool(engine_sem.clone(), work_rx, cancellation_token.clone());
 
         // Build TLS acceptor from the same env vars as the call-home transport.
-        let tls_acceptor = {
-            use crate::config::environment_names::tcp_response_stream::tls as env;
-            let cert = std::env::var(env::DYN_TCP_TLS_CERT_PATH).ok();
-            let key = std::env::var(env::DYN_TCP_TLS_KEY_PATH).ok();
-            match (cert, key) {
-                (Some(c), Some(k)) => {
-                    let config = crate::tls_utils::server_tls_config(c.as_ref(), k.as_ref(), None)
-                        .context(
-                            "Failed to build TCP request plane TLS config — check cert/key paths",
-                        )?;
-                    tracing::info!("TCP request plane: TLS enabled");
-                    Some(Arc::new(TlsAcceptor::from(Arc::new(config))))
-                }
-                (Some(_), None) | (None, Some(_)) => {
-                    anyhow::bail!(
-                        "Both {} and {} must be set to enable TCP request plane TLS",
-                        env::DYN_TCP_TLS_CERT_PATH,
-                        env::DYN_TCP_TLS_KEY_PATH,
-                    );
-                }
-                (None, None) => None,
+        use crate::config::environment_names::tcp_response_stream::tls as env;
+        let cert = std::env::var(env::DYN_TCP_TLS_CERT_PATH).ok();
+        let key = std::env::var(env::DYN_TCP_TLS_KEY_PATH).ok();
+        let client_ca = std::env::var(env::DYN_TCP_TLS_CLIENT_CA_CERT_PATH).ok();
+        let tls_acceptor = Self::request_plane_tls_acceptor(
+            cert.as_deref().map(std::path::Path::new),
+            key.as_deref().map(std::path::Path::new),
+            client_ca.as_deref().map(std::path::Path::new),
+        )?;
+        if tls_acceptor.is_none() {
+            let client_tls_set = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).is_ok()
+                || crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE)
+                || std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).is_ok()
+                || std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).is_ok();
+            if client_tls_set {
+                tracing::warn!(
+                    "Request plane TCP server is running in plaintext mode but client TLS env vars are set. \
+                     Set {} and {} to enable server-side TLS, or unset client TLS vars.",
+                    env::DYN_TCP_TLS_CERT_PATH,
+                    env::DYN_TCP_TLS_KEY_PATH,
+                );
             }
-        };
+        }
 
         Ok(Arc::new(Self {
             handlers: Arc::new(DashMap::new()),
@@ -239,6 +239,41 @@ impl SharedTcpServer {
             queue_capacity: work_queue_size,
             tls_acceptor,
         }))
+    }
+
+    fn request_plane_tls_acceptor(
+        cert: Option<&std::path::Path>,
+        key: Option<&std::path::Path>,
+        client_ca: Option<&std::path::Path>,
+    ) -> Result<Option<Arc<TlsAcceptor>>> {
+        use crate::config::environment_names::tcp_response_stream::tls as env;
+
+        match (cert, key) {
+            (Some(c), Some(k)) => {
+                let config = crate::tls_utils::server_tls_config(c, k, client_ca).context(
+                    "Failed to build TCP request plane TLS config — check cert/key/client CA paths",
+                )?;
+                tracing::info!(
+                    mtls = client_ca.is_some(),
+                    "TCP request plane: TLS enabled"
+                );
+                Ok(Some(Arc::new(TlsAcceptor::from(Arc::new(config)))))
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "Both {} and {} must be set to enable TCP request plane TLS",
+                    env::DYN_TCP_TLS_CERT_PATH,
+                    env::DYN_TCP_TLS_KEY_PATH,
+                );
+            }
+            (None, None) if client_ca.is_some() => anyhow::bail!(
+                "{} requires {} and {} to also be set",
+                env::DYN_TCP_TLS_CLIENT_CA_CERT_PATH,
+                env::DYN_TCP_TLS_CERT_PATH,
+                env::DYN_TCP_TLS_KEY_PATH,
+            ),
+            (None, None) => Ok(None),
+        }
     }
 
     /// Start the worker pool dispatcher that processes requests with bounded concurrency
@@ -835,9 +870,75 @@ mod tests {
     use super::*;
     use crate::pipeline::error::PipelineError;
     use async_trait::async_trait;
+    use std::io::Write;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tempfile::NamedTempFile;
     use tokio::time::Instant;
+
+    fn make_cert_files() -> (NamedTempFile, NamedTempFile) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert.pem().as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file
+            .write_all(key_pair.serialize_pem().as_bytes())
+            .unwrap();
+        (cert_file, key_file)
+    }
+
+    #[test]
+    fn request_plane_tls_reads_client_ca_path() {
+        let (cert, key) = make_cert_files();
+
+        let error = SharedTcpServer::request_plane_tls_acceptor(
+            Some(cert.path()),
+            Some(key.path()),
+            Some(std::path::Path::new(
+                "/nonexistent/request-plane-client-ca.pem",
+            )),
+        )
+        .err()
+        .expect("an invalid client CA path must fail mTLS configuration");
+
+        assert!(format!("{error:#}").contains("reading client CA cert"));
+    }
+
+    #[test]
+    fn request_plane_tls_acceptor_enables_mtls() {
+        let (cert, key) = make_cert_files();
+
+        assert!(
+            SharedTcpServer::request_plane_tls_acceptor(
+                Some(cert.path()),
+                Some(key.path()),
+                Some(cert.path()),
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn request_plane_tls_rejects_client_ca_without_server_identity() {
+        let (client_ca, _) = make_cert_files();
+
+        let error = SharedTcpServer::request_plane_tls_acceptor(
+            None,
+            None,
+            Some(client_ca.path()),
+        )
+        .err()
+        .expect("a client CA without a server certificate/key must fail");
+
+        assert!(error
+            .to_string()
+            .contains("DYN_TCP_TLS_CLIENT_CA_CERT_PATH requires"));
+    }
 
     /// Mock handler that simulates slow request processing for testing
     struct SlowMockHandler {

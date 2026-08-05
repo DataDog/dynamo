@@ -254,18 +254,48 @@ fn get_request_plane_tls_connector() -> anyhow::Result<&'static Option<TlsConnec
         use crate::config::environment_names::tcp_response_stream::tls as env;
         let ca_cert_path = std::env::var(env::DYN_TCP_TLS_CA_CERT_PATH).ok();
         let insecure = crate::config::env_is_truthy(env::DYN_TCP_TLS_INSECURE);
-        let tls_requested = ca_cert_path.is_some() || insecure;
-        if !tls_requested {
-            return Ok(None);
-        }
-        let tls_config = crate::tls_utils::client_tls_config(
+        let client_cert = std::env::var(env::DYN_TCP_TLS_CLIENT_CERT_PATH).ok();
+        let client_key = std::env::var(env::DYN_TCP_TLS_CLIENT_KEY_PATH).ok();
+
+        let connector = build_request_plane_tls_connector(
             ca_cert_path.as_deref().map(std::path::Path::new),
             insecure,
-            None,
-            None,
+            client_cert.as_deref().map(std::path::Path::new),
+            client_key.as_deref().map(std::path::Path::new),
         )?;
-        Ok(Some(TlsConnector::from(std::sync::Arc::new(tls_config))))
+        if connector.is_none() && std::env::var(env::DYN_TCP_TLS_CERT_PATH).is_ok() {
+            tracing::warn!(
+                "Request plane TCP client is running in plaintext mode but {} is set. \
+                 Set {} (or {} for development) to enable client-side TLS.",
+                env::DYN_TCP_TLS_CERT_PATH,
+                env::DYN_TCP_TLS_CA_CERT_PATH,
+                env::DYN_TCP_TLS_INSECURE,
+            );
+        }
+        Ok(connector)
     })
+}
+
+fn build_request_plane_tls_connector(
+    ca_cert_path: Option<&std::path::Path>,
+    insecure: bool,
+    client_cert: Option<&std::path::Path>,
+    client_key: Option<&std::path::Path>,
+) -> anyhow::Result<Option<TlsConnector>> {
+    let tls_requested =
+        ca_cert_path.is_some() || insecure || client_cert.is_some() || client_key.is_some();
+    if !tls_requested {
+        return Ok(None);
+    }
+    if !insecure && ca_cert_path.is_none() {
+        anyhow::bail!(
+            "Request plane TLS is enabled but DYN_TCP_TLS_CA_CERT_PATH is not set and \
+             DYN_TCP_TLS_INSECURE is not true; provide a CA cert or set insecure mode for development",
+        );
+    }
+    let tls_config =
+        crate::tls_utils::client_tls_config(ca_cert_path, insecure, client_cert, client_key)?;
+    Ok(Some(TlsConnector::from(std::sync::Arc::new(tls_config))))
 }
 
 impl TcpConnection {
@@ -548,6 +578,14 @@ impl TcpConnection {
                     // re-sent if reconnect-and-retry is ever added, then exit.
                     send_buf.clear();
                     let err_msg = format!("Write failed: {}", e);
+                    for tx in response_batch.drain(..) {
+                        let _ = tx.send(Err(anyhow::anyhow!("{}", err_msg)));
+                    }
+                    return Err(e.into());
+                }
+                if let Err(e) = write_half.flush().await {
+                    send_buf.clear();
+                    let err_msg = format!("Flush failed: {e}");
                     for tx in response_batch.drain(..) {
                         let _ = tx.send(Err(anyhow::anyhow!("{}", err_msg)));
                     }
@@ -1515,9 +1553,147 @@ impl RequestPlaneClient for TcpRequestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::atomic::AtomicUsize;
+    use tempfile::NamedTempFile;
     use tokio::io::AsyncReadExt;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
+
+    fn make_cert_files() -> (NamedTempFile, NamedTempFile) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert.pem().as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file
+            .write_all(key_pair.serialize_pem().as_bytes())
+            .unwrap();
+        (cert_file, key_file)
+    }
+
+    #[test]
+    fn request_plane_tls_connector_uses_client_identity() {
+        let (cert, key) = make_cert_files();
+
+        assert!(
+            build_request_plane_tls_connector(
+                Some(cert.path()),
+                false,
+                Some(cert.path()),
+                Some(key.path()),
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn request_plane_tls_connector_rejects_client_identity_without_ca() {
+        let (cert, key) = make_cert_files();
+
+        let error = build_request_plane_tls_connector(
+            None,
+            false,
+            Some(cert.path()),
+            Some(key.path()),
+        )
+        .err()
+        .expect("a client identity without a server CA must fail");
+
+        assert!(error
+            .to_string()
+            .contains("DYN_TCP_TLS_CA_CERT_PATH is not set"));
+    }
+
+    #[tokio::test]
+    async fn request_plane_mtls_handshake_requires_client_identity() {
+        let (cert, key) = make_cert_files();
+        let server_config =
+            crate::tls_utils::server_tls_config(cert.path(), key.path(), Some(cert.path()))
+                .unwrap();
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let connector = build_request_plane_tls_connector(
+            Some(cert.path()),
+            false,
+            Some(cert.path()),
+            Some(key.path()),
+        )
+        .unwrap()
+        .unwrap();
+        let (server_result, client_result) = tokio::join!(
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                acceptor.accept(stream).await
+            },
+            async {
+                connector
+                    .connect(
+                        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                        TcpStream::connect(address).await.unwrap(),
+                    )
+                    .await
+            },
+        );
+
+        assert!(server_result.is_ok());
+        assert!(client_result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_plane_mtls_rejects_client_without_identity() {
+        let (cert, key) = make_cert_files();
+        let server_config =
+            crate::tls_utils::server_tls_config(cert.path(), key.path(), Some(cert.path()))
+                .unwrap();
+        let acceptor = TlsAcceptor::from(std::sync::Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let connector =
+            build_request_plane_tls_connector(Some(cert.path()), false, None, None)
+                .unwrap()
+                .unwrap();
+        let (server_result, client_result) = tokio::join!(
+            async {
+                let (stream, _) = listener.accept().await.unwrap();
+                acceptor.accept(stream).await
+            },
+            async {
+                connector
+                    .connect(
+                        rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                        TcpStream::connect(address).await.unwrap(),
+                    )
+                    .await
+            },
+        );
+
+        // Enforcement is server-side: rustls reports NoCertificatesPresented.
+        // Client connect() may still return Ok because the client handshake can
+        // finish before the server's fatal alert is observed.
+        assert!(
+            server_result.is_err(),
+            "server must reject a client that presents no certificate: {server_result:?}"
+        );
+        match client_result {
+            Ok(mut stream) => {
+                let mut buf = [0u8; 1];
+                let read = stream.read(&mut buf).await;
+                assert!(
+                    matches!(read, Ok(0) | Err(_)),
+                    "post-reject client I/O must fail or EOF, got {read:?}"
+                );
+            }
+            Err(_) => {}
+        }
+    }
 
     #[test]
     fn test_tcp_config_default() {
