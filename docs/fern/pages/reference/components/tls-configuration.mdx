@@ -5,12 +5,13 @@ title: TLS
 subtitle: Encrypt the TCP request/response streams and NATS connections
 ---
 
-Dynamo supports opt-in TLS encryption on all TCP transports between frontends
-and workers. When enabled, both the **request plane** (frontend → worker
-inference requests) and the **response stream** (worker → frontend inference
-output) are encrypted using [rustls](https://github.com/rustls/rustls) with the
-`ring` cryptographic provider. When no TLS configuration is provided, all
-transports operate in plaintext exactly as before.
+Dynamo supports opt-in TLS encryption on the TCP request and response streams
+between frontends and workers. When enabled, both the **request plane**
+(frontend → worker inference requests) and the **response stream** (worker →
+frontend inference output) are encrypted using
+[rustls](https://github.com/rustls/rustls) with the `ring` cryptographic
+provider. When no TLS configuration is provided, these streams operate in
+plaintext exactly as before.
 
 The `DYN_TCP_TLS_*` environment variables encrypt the frontend↔worker TCP
 request and response streams; NATS traffic is encrypted separately via NATS TLS
