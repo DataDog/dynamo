@@ -209,8 +209,9 @@ encrypted:
 - Server and mTLS client identity certificate/key files are checked for changes
   at most once every 30 seconds when a new handshake occurs. A valid rotated
   pair is loaded without restarting the process; a partial or invalid rotation
-  keeps the last valid identity. CA bundle changes still require a process
-  restart.
+  keeps the last valid identity and retries on the next handshake after a short
+  backoff (1s) instead of waiting the full check interval. CA bundle changes
+  still require a process restart.
 - The TLS handshake is spawned per-connection on both the request plane and
   response stream servers so the accept loop is never blocked.
 - Invalid TLS configuration on the request plane (e.g. bad cert path) prevents
