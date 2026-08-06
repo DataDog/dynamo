@@ -34,7 +34,8 @@ pub fn handshake_timeout() -> std::time::Duration {
 /// When `client_ca_cert_path` is `Some`, the server requires clients to present
 /// a certificate signed by that CA (mutual TLS). When `None`, client
 /// certificates are not requested. The server identity is checked at most once
-/// every 30 seconds and atomically replaced after a valid cert/key pair is observed.
+/// every 30 seconds (sooner after a failed reload) and atomically replaced after
+/// a valid cert/key pair is observed.
 pub fn server_tls_config(
     cert_path: &Path,
     key_path: &Path,
@@ -84,8 +85,8 @@ pub fn server_tls_config(
 /// - `insecure`: skip certificate verification entirely. **Dev/test only.**
 /// - `client_cert_path` + `client_key_path`: when both are `Some`, the client
 ///   presents this certificate to the server (mutual TLS). The client identity
-///   is checked at most once every 30 seconds and atomically replaced after a
-///   valid cert/key pair is observed.
+///   is checked at most once every 30 seconds (sooner after a failed reload) and
+///   atomically replaced after a valid cert/key pair is observed.
 pub fn client_tls_config(
     ca_cert_path: Option<&Path>,
     insecure: bool,
@@ -158,8 +159,13 @@ struct ReloadingCertifiedKey {
 }
 
 struct ReloadState {
+    /// Fingerprint of the last successfully loaded identity.
     fingerprint: IdentityFingerprint,
     last_checked: Instant,
+    /// Minimum time between filesystem checks. Full interval after a successful
+    /// check; short backoff after a transient inspect/load failure so rotation
+    /// is not delayed by a full 30s after Emissary finishes swapping files.
+    min_check_interval: Duration,
 }
 
 struct LoadedIdentity {
@@ -167,10 +173,21 @@ struct LoadedIdentity {
     certified_key: Arc<CertifiedKey>,
 }
 
+/// Cheap metadata probe used to decide whether a reload is needed.
+#[derive(Debug, Eq, PartialEq)]
+struct IdentityProbe {
+    cert: FileFingerprint,
+    key: FileFingerprint,
+}
+
+/// Fingerprint of a successfully loaded identity. Metadata is captured after the
+/// read so it describes the generation we actually parsed; `content_hash` covers
+/// in-place rewrites that may not change mtime/len reliably.
 #[derive(Debug, Eq, PartialEq)]
 struct IdentityFingerprint {
     cert: FileFingerprint,
     key: FileFingerprint,
+    content_hash: [u8; 32],
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -192,6 +209,7 @@ impl fmt::Debug for ReloadingCertifiedKey {
 
 impl ReloadingCertifiedKey {
     const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+    const FAILURE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
     fn new(cert_path: &Path, key_path: &Path) -> Result<Self> {
         let cert_path = cert_path.to_path_buf();
@@ -204,17 +222,20 @@ impl ReloadingCertifiedKey {
             reload_state: Mutex::new(ReloadState {
                 fingerprint: loaded.fingerprint,
                 last_checked: Instant::now(),
+                min_check_interval: Self::RELOAD_CHECK_INTERVAL,
             }),
         })
     }
 
     fn load(cert_path: &Path, key_path: &Path) -> Result<LoadedIdentity> {
-        let fingerprint = IdentityFingerprint::new(cert_path, key_path)?;
+        // Read first, then fingerprint. This avoids storing metadata for a
+        // different generation than the bytes we parsed.
         let cert_pem = std::fs::read(cert_path)
             .with_context(|| format!("reading cert: {}", cert_path.display()))?;
         let key_pem = std::fs::read(key_path)
             .with_context(|| format!("reading key: {}", key_path.display()))?;
         let certified_key = load_certified_key(&cert_pem, &key_pem)?;
+        let fingerprint = IdentityFingerprint::from_loaded(cert_path, key_path, &cert_pem, &key_pem)?;
         Ok(LoadedIdentity {
             fingerprint,
             certified_key: Arc::new(certified_key),
@@ -234,33 +255,60 @@ impl ReloadingCertifiedKey {
             Err(TryLockError::WouldBlock) => return self.current.load_full(),
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
-        if state.last_checked.elapsed() < Self::RELOAD_CHECK_INTERVAL {
+        if state.last_checked.elapsed() < state.min_check_interval {
             return self.current.load_full();
         }
-        state.last_checked = Instant::now();
 
-        let fingerprint = match IdentityFingerprint::new(&self.cert_path, &self.key_path) {
-            Ok(fingerprint) => fingerprint,
+        let probe = match IdentityProbe::new(&self.cert_path, &self.key_path) {
+            Ok(probe) => probe,
             Err(error) => {
+                state.last_checked = Instant::now();
+                state.min_check_interval = Self::FAILURE_RETRY_INTERVAL;
                 tracing::warn!(
+                    cert_path = %self.cert_path.display(),
+                    key_path = %self.key_path.display(),
                     %error,
                     "failed to inspect rotated TLS identity; keeping the last valid identity"
                 );
                 return self.current.load_full();
             }
         };
-        if state.fingerprint == fingerprint {
+        if state.fingerprint.matches_probe(&probe) {
+            state.last_checked = Instant::now();
+            state.min_check_interval = Self::RELOAD_CHECK_INTERVAL;
             return self.current.load_full();
         }
 
         match Self::load(&self.cert_path, &self.key_path) {
             Ok(reloaded) => {
-                self.current.store(reloaded.certified_key);
+                let content_changed =
+                    state.fingerprint.content_hash != reloaded.fingerprint.content_hash;
+                if content_changed {
+                    let cert_count = reloaded.certified_key.cert.len();
+                    self.current.store(reloaded.certified_key);
+                    tracing::info!(
+                        cert_path = %self.cert_path.display(),
+                        key_path = %self.key_path.display(),
+                        cert_count,
+                        "reloaded rotated TLS certificate and private key"
+                    );
+                } else {
+                    tracing::debug!(
+                        cert_path = %self.cert_path.display(),
+                        key_path = %self.key_path.display(),
+                        "TLS identity metadata changed but loaded content is unchanged"
+                    );
+                }
                 state.fingerprint = reloaded.fingerprint;
-                tracing::info!("reloaded rotated TLS certificate and private key");
+                state.last_checked = Instant::now();
+                state.min_check_interval = Self::RELOAD_CHECK_INTERVAL;
             }
             Err(error) => {
+                state.last_checked = Instant::now();
+                state.min_check_interval = Self::FAILURE_RETRY_INTERVAL;
                 tracing::warn!(
+                    cert_path = %self.cert_path.display(),
+                    key_path = %self.key_path.display(),
                     %error,
                     "failed to load rotated TLS certificate and private key; keeping the last valid identity"
                 );
@@ -275,11 +323,35 @@ impl ReloadingCertifiedKey {
             .reload_state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.last_checked = Instant::now() - Self::RELOAD_CHECK_INTERVAL;
+        state.min_check_interval = Duration::ZERO;
+        state.last_checked = Instant::now() - Duration::from_secs(1);
     }
 }
 
 impl IdentityFingerprint {
+    fn from_loaded(
+        cert_path: &Path,
+        key_path: &Path,
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<Self> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(cert_pem);
+        hasher.update(&[0]);
+        hasher.update(key_pem);
+        Ok(Self {
+            cert: FileFingerprint::new(cert_path)?,
+            key: FileFingerprint::new(key_path)?,
+            content_hash: *hasher.finalize().as_bytes(),
+        })
+    }
+
+    fn matches_probe(&self, probe: &IdentityProbe) -> bool {
+        self.cert == probe.cert && self.key == probe.key
+    }
+}
+
+impl IdentityProbe {
     fn new(cert_path: &Path, key_path: &Path) -> Result<Self> {
         Ok(Self {
             cert: FileFingerprint::new(cert_path)?,
@@ -486,6 +558,25 @@ mod tests {
     }
 
     #[test]
+    fn certified_key_does_not_reload_before_check_interval() {
+        let (cert_pem, key_pem) = make_cert_pem();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        let resolver = ReloadingCertifiedKey::new(cert_file.path(), key_file.path()).unwrap();
+        let original = resolver.resolve_key();
+
+        let (rotated_cert_pem, rotated_key_pem) = make_cert_pem();
+        std::fs::write(cert_file.path(), rotated_cert_pem).unwrap();
+        std::fs::write(key_file.path(), rotated_key_pem).unwrap();
+
+        let still_original = resolver.resolve_key();
+        assert_eq!(original.cert, still_original.cert);
+    }
+
+    #[test]
     fn certified_key_resolve_does_not_wait_for_concurrent_reload() {
         let (cert, key) = make_cert_files();
         let resolver = ReloadingCertifiedKey::new(cert.path(), key.path()).unwrap();
@@ -522,8 +613,10 @@ mod tests {
                 .unwrap();
         let original = resolver.resolve_key();
 
-        std::fs::remove_file(&current).unwrap();
-        symlink(&second_generation, &current).unwrap();
+        // Atomic symlink swap (Emissary-style): rename over the live link.
+        let current_tmp = root.path().join("server.tmp");
+        symlink(&second_generation, &current_tmp).unwrap();
+        std::fs::rename(&current_tmp, &current).unwrap();
 
         resolver.mark_reload_due();
         let rotated = resolver.resolve_key();
@@ -547,5 +640,67 @@ mod tests {
         resolver.mark_reload_due();
         let after_partial_rotation = resolver.resolve_key();
         assert_eq!(original.cert, after_partial_rotation.cert);
+        assert_eq!(
+            resolver.reload_state.lock().unwrap().min_check_interval,
+            ReloadingCertifiedKey::FAILURE_RETRY_INTERVAL
+        );
+    }
+
+    #[test]
+    fn certified_key_keeps_last_valid_identity_on_corrupt_pem() {
+        let (cert_pem, key_pem) = make_cert_pem();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        let resolver = ReloadingCertifiedKey::new(cert_file.path(), key_file.path()).unwrap();
+        let original = resolver.resolve_key();
+
+        std::fs::write(cert_file.path(), b"not-a-certificate").unwrap();
+        std::fs::write(key_file.path(), b"not-a-key").unwrap();
+
+        resolver.mark_reload_due();
+        let after_corrupt = resolver.resolve_key();
+        assert_eq!(original.cert, after_corrupt.cert);
+        assert_eq!(
+            resolver.reload_state.lock().unwrap().min_check_interval,
+            ReloadingCertifiedKey::FAILURE_RETRY_INTERVAL
+        );
+    }
+
+    #[test]
+    fn certified_key_retries_soon_after_failed_reload() {
+        let (cert_pem, key_pem) = make_cert_pem();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        let resolver = ReloadingCertifiedKey::new(cert_file.path(), key_file.path()).unwrap();
+        let original = resolver.resolve_key();
+
+        // Partial rotation fails keys_match and schedules a short retry.
+        let (rotated_cert_pem, _) = make_cert_pem();
+        std::fs::write(cert_file.path(), &rotated_cert_pem).unwrap();
+        resolver.mark_reload_due();
+        assert_eq!(original.cert, resolver.resolve_key().cert);
+        assert_eq!(
+            resolver.reload_state.lock().unwrap().min_check_interval,
+            ReloadingCertifiedKey::FAILURE_RETRY_INTERVAL
+        );
+
+        // Complete the rotation; the short backoff (not the full 30s interval)
+        // allows the next due check to pick up the valid pair.
+        let (final_cert_pem, final_key_pem) = make_cert_pem();
+        std::fs::write(cert_file.path(), final_cert_pem).unwrap();
+        std::fs::write(key_file.path(), final_key_pem).unwrap();
+        resolver.mark_reload_due();
+        let rotated = resolver.resolve_key();
+        assert_ne!(original.cert, rotated.cert);
+        assert_eq!(
+            resolver.reload_state.lock().unwrap().min_check_interval,
+            ReloadingCertifiedKey::RELOAD_CHECK_INTERVAL
+        );
     }
 }
