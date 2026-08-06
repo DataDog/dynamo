@@ -7,10 +7,16 @@
 //! `ServerConfig` / `ClientConfig` objects used by the NATS transport
 //! and the TCP request-plane.
 
-use std::{path::Path, sync::Arc};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, TryLockError},
+    time::{Duration, Instant, SystemTime},
+};
 
 use anyhow::{Context, Result};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use arc_swap::ArcSwap;
+use rustls::{ClientConfig, RootCertStore, ServerConfig, SignatureScheme, sign::CertifiedKey};
 use rustls_pemfile::{certs, private_key};
 
 /// TLS handshake timeout, configurable via `DYN_TCP_TLS_HANDSHAKE_TIMEOUT_SECS` (default: 3s).
@@ -27,24 +33,14 @@ pub fn handshake_timeout() -> std::time::Duration {
 ///
 /// When `client_ca_cert_path` is `Some`, the server requires clients to present
 /// a certificate signed by that CA (mutual TLS). When `None`, client
-/// certificates are not requested.
+/// certificates are not requested. The server identity is checked at most once
+/// every 30 seconds and atomically replaced after a valid cert/key pair is observed.
 pub fn server_tls_config(
     cert_path: &Path,
     key_path: &Path,
     client_ca_cert_path: Option<&Path>,
 ) -> Result<ServerConfig> {
-    let cert_pem = std::fs::read(cert_path)
-        .with_context(|| format!("reading cert: {}", cert_path.display()))?;
-    let key_pem =
-        std::fs::read(key_path).with_context(|| format!("reading key: {}", key_path.display()))?;
-
-    let cert_chain = certs(&mut cert_pem.as_slice())
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing certificate PEM")?;
-
-    let key = private_key(&mut key_pem.as_slice())
-        .context("parsing private key PEM")?
-        .context("no private key found in PEM")?;
+    let cert_resolver = Arc::new(ReloadingCertifiedKey::new(cert_path, key_path)?);
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = ServerConfig::builder_with_provider(provider.clone())
@@ -71,13 +67,11 @@ pub fn server_tls_config(
         .context("building client certificate verifier")?;
         builder
             .with_client_cert_verifier(verifier)
-            .with_single_cert(cert_chain, key)
-            .context("building mTLS ServerConfig")?
+            .with_cert_resolver(cert_resolver)
     } else {
         builder
             .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .context("building ServerConfig")?
+            .with_cert_resolver(cert_resolver)
     };
 
     Ok(config)
@@ -89,7 +83,9 @@ pub fn server_tls_config(
 ///   When `None`, the root store is empty — supply a CA cert or use `insecure`.
 /// - `insecure`: skip certificate verification entirely. **Dev/test only.**
 /// - `client_cert_path` + `client_key_path`: when both are `Some`, the client
-///   presents this certificate to the server (mutual TLS).
+///   presents this certificate to the server (mutual TLS). The client identity
+///   is checked at most once every 30 seconds and atomically replaced after a
+///   valid cert/key pair is observed.
 pub fn client_tls_config(
     ca_cert_path: Option<&Path>,
     insecure: bool,
@@ -111,10 +107,7 @@ pub fn client_tls_config(
             .with_custom_certificate_verifier(Arc::new(NoVerifier));
         let config = match (client_cert_path, client_key_path) {
             (Some(cp), Some(kp)) => {
-                let (chain, key) = load_client_cert(cp, kp)?;
-                builder
-                    .with_client_auth_cert(chain, key)
-                    .context("building insecure mTLS ClientConfig")?
+                builder.with_client_cert_resolver(Arc::new(ReloadingCertifiedKey::new(cp, kp)?))
             }
             _ => builder.with_no_client_auth(),
         };
@@ -149,10 +142,7 @@ pub fn client_tls_config(
 
     let config = match (client_cert_path, client_key_path) {
         (Some(cp), Some(kp)) => {
-            let (chain, key) = load_client_cert(cp, kp)?;
-            builder
-                .with_client_auth_cert(chain, key)
-                .context("building mTLS ClientConfig")?
+            builder.with_client_cert_resolver(Arc::new(ReloadingCertifiedKey::new(cp, kp)?))
         }
         _ => builder.with_no_client_auth(),
     };
@@ -160,24 +150,197 @@ pub fn client_tls_config(
     Ok(config)
 }
 
-fn load_client_cert(
-    cert_path: &Path,
-    key_path: &Path,
-) -> Result<(
-    Vec<rustls::pki_types::CertificateDer<'static>>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-)> {
-    let cert_pem = std::fs::read(cert_path)
-        .with_context(|| format!("reading client cert: {}", cert_path.display()))?;
-    let key_pem = std::fs::read(key_path)
-        .with_context(|| format!("reading client key: {}", key_path.display()))?;
-    let cert_chain = certs(&mut cert_pem.as_slice())
+struct ReloadingCertifiedKey {
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    current: ArcSwap<CertifiedKey>,
+    reload_state: Mutex<ReloadState>,
+}
+
+struct ReloadState {
+    fingerprint: IdentityFingerprint,
+    last_checked: Instant,
+}
+
+struct LoadedIdentity {
+    fingerprint: IdentityFingerprint,
+    certified_key: Arc<CertifiedKey>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct IdentityFingerprint {
+    cert: FileFingerprint,
+    key: FileFingerprint,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FileFingerprint {
+    canonical_path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+}
+
+impl fmt::Debug for ReloadingCertifiedKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReloadingCertifiedKey")
+            .field("cert_path", &self.cert_path)
+            .field("key_path", &self.key_path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReloadingCertifiedKey {
+    const RELOAD_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+    fn new(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        let cert_path = cert_path.to_path_buf();
+        let key_path = key_path.to_path_buf();
+        let loaded = Self::load(&cert_path, &key_path)?;
+        Ok(Self {
+            cert_path,
+            key_path,
+            current: ArcSwap::from(loaded.certified_key),
+            reload_state: Mutex::new(ReloadState {
+                fingerprint: loaded.fingerprint,
+                last_checked: Instant::now(),
+            }),
+        })
+    }
+
+    fn load(cert_path: &Path, key_path: &Path) -> Result<LoadedIdentity> {
+        let fingerprint = IdentityFingerprint::new(cert_path, key_path)?;
+        let cert_pem = std::fs::read(cert_path)
+            .with_context(|| format!("reading cert: {}", cert_path.display()))?;
+        let key_pem = std::fs::read(key_path)
+            .with_context(|| format!("reading key: {}", key_path.display()))?;
+        let certified_key = load_certified_key(&cert_pem, &key_pem)?;
+        Ok(LoadedIdentity {
+            fingerprint,
+            certified_key: Arc::new(certified_key),
+        })
+    }
+
+    fn resolve_key(&self) -> Arc<CertifiedKey> {
+        self.refresh()
+    }
+
+    fn refresh(&self) -> Arc<CertifiedKey> {
+        // Never make a handshake wait for another handshake's filesystem check.
+        // The current identity remains available through ArcSwap while one caller
+        // serializes and performs the rate-limited reload.
+        let mut state = match self.reload_state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return self.current.load_full(),
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        if state.last_checked.elapsed() < Self::RELOAD_CHECK_INTERVAL {
+            return self.current.load_full();
+        }
+        state.last_checked = Instant::now();
+
+        let fingerprint = match IdentityFingerprint::new(&self.cert_path, &self.key_path) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to inspect rotated TLS identity; keeping the last valid identity"
+                );
+                return self.current.load_full();
+            }
+        };
+        if state.fingerprint == fingerprint {
+            return self.current.load_full();
+        }
+
+        match Self::load(&self.cert_path, &self.key_path) {
+            Ok(reloaded) => {
+                self.current.store(reloaded.certified_key);
+                state.fingerprint = reloaded.fingerprint;
+                tracing::info!("reloaded rotated TLS certificate and private key");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "failed to load rotated TLS certificate and private key; keeping the last valid identity"
+                );
+            }
+        }
+        self.current.load_full()
+    }
+
+    #[cfg(test)]
+    fn mark_reload_due(&self) {
+        let mut state = self
+            .reload_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.last_checked = Instant::now() - Self::RELOAD_CHECK_INTERVAL;
+    }
+}
+
+impl IdentityFingerprint {
+    fn new(cert_path: &Path, key_path: &Path) -> Result<Self> {
+        Ok(Self {
+            cert: FileFingerprint::new(cert_path)?,
+            key: FileFingerprint::new(key_path)?,
+        })
+    }
+}
+
+impl FileFingerprint {
+    fn new(path: &Path) -> Result<Self> {
+        let canonical_path = std::fs::canonicalize(path)
+            .with_context(|| format!("resolving TLS file path: {}", path.display()))?;
+        let metadata = std::fs::metadata(&canonical_path)
+            .with_context(|| format!("reading TLS file metadata: {}", path.display()))?;
+        let modified = metadata
+            .modified()
+            .with_context(|| format!("reading TLS file modification time: {}", path.display()))?;
+        Ok(Self {
+            canonical_path,
+            len: metadata.len(),
+            modified,
+        })
+    }
+}
+
+impl rustls::server::ResolvesServerCert for ReloadingCertifiedKey {
+    fn resolve(&self, _client_hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.resolve_key())
+    }
+}
+
+impl rustls::client::ResolvesClientCert for ReloadingCertifiedKey {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        Some(self.resolve_key())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+fn load_certified_key(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey> {
+    let mut cert_reader = cert_pem;
+    let cert_chain = certs(&mut cert_reader)
         .collect::<Result<Vec<_>, _>>()
-        .context("parsing client certificate PEM")?;
-    let key = private_key(&mut key_pem.as_slice())
-        .context("parsing client private key PEM")?
-        .context("no private key found in client PEM")?;
-    Ok((cert_chain, key))
+        .context("parsing certificate PEM")?;
+    let mut key_reader = key_pem;
+    let key = private_key(&mut key_reader)
+        .context("parsing private key PEM")?
+        .context("no private key found in PEM")?;
+    let signing_key =
+        rustls::crypto::ring::sign::any_supported_type(&key).context("loading TLS private key")?;
+    let certified_key = CertifiedKey::new(cert_chain, signing_key);
+    certified_key
+        .keys_match()
+        .context("TLS certificate and private key do not match")?;
+    Ok(certified_key)
 }
 
 /// Certificate verifier that accepts any certificate.
@@ -243,6 +406,15 @@ mod tests {
         (cert_file, key_file)
     }
 
+    fn make_cert_pem() -> (String, String) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key_pair)
+            .unwrap();
+        (cert.pem(), key_pair.serialize_pem())
+    }
+
     #[test]
     fn server_config_roundtrip() {
         let (cert, key) = make_cert_files();
@@ -291,5 +463,89 @@ mod tests {
             .to_string()
             .contains("reading CA cert")
         );
+    }
+
+    #[test]
+    fn certified_key_reloads_rotated_files() {
+        let (cert_pem, key_pem) = make_cert_pem();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        let resolver = ReloadingCertifiedKey::new(cert_file.path(), key_file.path()).unwrap();
+        let original = resolver.resolve_key();
+
+        let (rotated_cert_pem, rotated_key_pem) = make_cert_pem();
+        std::fs::write(cert_file.path(), rotated_cert_pem).unwrap();
+        std::fs::write(key_file.path(), rotated_key_pem).unwrap();
+
+        resolver.mark_reload_due();
+        let rotated = resolver.resolve_key();
+        assert_ne!(original.cert, rotated.cert);
+    }
+
+    #[test]
+    fn certified_key_resolve_does_not_wait_for_concurrent_reload() {
+        let (cert, key) = make_cert_files();
+        let resolver = ReloadingCertifiedKey::new(cert.path(), key.path()).unwrap();
+        let expected = resolver.resolve_key();
+
+        let _reload_guard = resolver.reload_state.lock().unwrap();
+        let resolved = resolver.resolve_key();
+
+        assert_eq!(expected.cert, resolved.cert);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certified_key_reloads_symlinked_certificate_generation() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let first_generation = root.path().join("server-1");
+        let second_generation = root.path().join("server-2");
+        std::fs::create_dir(&first_generation).unwrap();
+        std::fs::create_dir(&second_generation).unwrap();
+
+        let (first_cert, first_key) = make_cert_pem();
+        std::fs::write(first_generation.join("cert.pem"), first_cert).unwrap();
+        std::fs::write(first_generation.join("key.pem"), first_key).unwrap();
+        let (second_cert, second_key) = make_cert_pem();
+        std::fs::write(second_generation.join("cert.pem"), second_cert).unwrap();
+        std::fs::write(second_generation.join("key.pem"), second_key).unwrap();
+
+        let current = root.path().join("server");
+        symlink(&first_generation, &current).unwrap();
+        let resolver =
+            ReloadingCertifiedKey::new(&current.join("cert.pem"), &current.join("key.pem"))
+                .unwrap();
+        let original = resolver.resolve_key();
+
+        std::fs::remove_file(&current).unwrap();
+        symlink(&second_generation, &current).unwrap();
+
+        resolver.mark_reload_due();
+        let rotated = resolver.resolve_key();
+        assert_ne!(original.cert, rotated.cert);
+    }
+
+    #[test]
+    fn certified_key_keeps_last_valid_identity_during_partial_rotation() {
+        let (cert_pem, key_pem) = make_cert_pem();
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        let resolver = ReloadingCertifiedKey::new(cert_file.path(), key_file.path()).unwrap();
+        let original = resolver.resolve_key();
+
+        let (rotated_cert_pem, _) = make_cert_pem();
+        std::fs::write(cert_file.path(), rotated_cert_pem).unwrap();
+
+        resolver.mark_reload_due();
+        let after_partial_rotation = resolver.resolve_key();
+        assert_eq!(original.cert, after_partial_rotation.cert);
     }
 }
