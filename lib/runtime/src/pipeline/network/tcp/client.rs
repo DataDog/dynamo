@@ -263,9 +263,9 @@ impl TcpClient {
 /// Cached TCP TLS connector — built once from env vars on first TCP connection, reused for every
 /// subsequent connection. `None` means plaintext; `Some(connector)` means TLS/mTLS.
 ///
-/// The config is intentionally immutable after the first build: `rustls::ClientConfig` is
-/// cheaply `Arc`-cloned per-connection, so sharing it is free. Cert rotation requires a process
-/// restart; this is consistent with how most services handle TLS credential updates.
+/// The `rustls::ClientConfig` is cheaply `Arc`-cloned per connection. Its client-certificate
+/// resolver reloads the configured identity files when they change, so certificate rotation does
+/// not require a process restart.
 static TCP_TLS_CONNECTOR: once_cell::sync::OnceCell<Option<TlsConnector>> =
     once_cell::sync::OnceCell::new();
 
