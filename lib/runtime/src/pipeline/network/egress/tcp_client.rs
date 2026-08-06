@@ -245,7 +245,8 @@ struct TcpConnection {
     post_enqueue_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
-/// Cached TLS connector for the request plane. Built once from env vars.
+/// Cached TLS connector for the request plane. Built once from env vars; its client-certificate
+/// resolver reloads the configured identity files when they change.
 static REQUEST_PLANE_TLS_CONNECTOR: once_cell::sync::OnceCell<Option<TlsConnector>> =
     once_cell::sync::OnceCell::new();
 
