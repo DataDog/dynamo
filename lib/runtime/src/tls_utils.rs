@@ -364,11 +364,15 @@ impl FileFingerprint {
     fn new(path: &Path) -> Result<Self> {
         let canonical_path = std::fs::canonicalize(path)
             .with_context(|| format!("resolving TLS file path: {}", path.display()))?;
-        let metadata = std::fs::metadata(&canonical_path)
-            .with_context(|| format!("reading TLS file metadata: {}", path.display()))?;
-        let modified = metadata
-            .modified()
-            .with_context(|| format!("reading TLS file modification time: {}", path.display()))?;
+        let metadata = std::fs::metadata(&canonical_path).with_context(|| {
+            format!("reading TLS file metadata: {}", canonical_path.display())
+        })?;
+        let modified = metadata.modified().with_context(|| {
+            format!(
+                "reading TLS file modification time: {}",
+                canonical_path.display()
+            )
+        })?;
         Ok(Self {
             canonical_path,
             len: metadata.len(),
