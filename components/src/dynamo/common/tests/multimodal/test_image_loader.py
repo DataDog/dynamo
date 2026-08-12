@@ -179,10 +179,11 @@ async def test_http_rejected_by_default() -> None:
         await strict_loader.load_image("http://example.com/x.png")
 
 
-async def test_data_url_invalid_base64_normalized(loader: ImageLoader) -> None:
-    """Malformed base64 data URL should raise ValueError."""
-    with pytest.raises(ValueError, match="Invalid base64"):
+async def test_data_url_invalid_base64_raises_400(loader: ImageLoader) -> None:
+    """Malformed base64 is invalid request data, not an internal server error."""
+    with pytest.raises(HttpStatusError) as exc_info:
         await loader.load_image("data:image/png;base64,NOT_VALID!!!")
+    assert exc_info.value.status == 400
 
 
 async def test_data_url_non_image_rejected(loader: ImageLoader) -> None:
@@ -270,6 +271,31 @@ async def test_unsupported_format_batch_data_url_raises_415(
             [{URL_VARIANT_KEY: f"data:image/svg+xml;base64,{svg_b64}"}]
         )
     assert exc_info.value.status == 415
+
+
+async def test_truncated_png_batch_data_url_raises_400(
+    loader: ImageLoader,
+) -> None:
+    """A recognized but corrupt image must surface as a client validation error."""
+    truncated_png_b64 = base64.b64encode(PNG_BYTES[:45]).decode()
+    with pytest.raises(HttpStatusError) as exc_info:
+        await loader.load_image_batch(
+            [{URL_VARIANT_KEY: f"data:image/png;base64,{truncated_png_b64}"}]
+        )
+    assert exc_info.value.status == 400
+
+
+async def test_truncated_png_batch_url_raises_400(loader: ImageLoader) -> None:
+    """Corrupt image bytes fetched from a client-supplied URL are invalid input."""
+    mock_fetch = _mock_fetch_bytes(content=PNG_BYTES[:45])
+    with (
+        patch(_FETCH_BYTES_PATH, mock_fetch),
+        pytest.raises(HttpStatusError) as exc_info,
+    ):
+        await loader.load_image_batch(
+            [{URL_VARIANT_KEY: "https://example.com/truncated.png"}]
+        )
+    assert exc_info.value.status == 400
 
 
 # --- SSRF / URL-validation error contract ---

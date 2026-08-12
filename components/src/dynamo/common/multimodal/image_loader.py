@@ -147,6 +147,12 @@ class ImageLoader:
         except Image.UnidentifiedImageError as e:
             logger.error(f"Unsupported image format loading: '{image_url}'")
             raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
+        except OSError as e:
+            # Pillow recognized the media type but could not decode its contents
+            # (for example, a truncated PNG). The supplied media is invalid input,
+            # not an inference-server failure.
+            logger.error("Invalid image data returned by media URL")
+            raise HttpStatusError(400, "Invalid image data", image_url) from e
         except UrlValidationError as e:
             # Keep the type (must precede ValueError, its base) so the batch
             # caller can still map this client error to a 4xx, not a 500.
@@ -227,16 +233,22 @@ class ImageLoader:
                     image_data = BytesIO(image_bytes)
                 return await self._open_image(image_data)
             except Image.UnidentifiedImageError as e:
-                logger.error(f"Unsupported image format decoding: '{image_url}'")
-                raise HttpStatusError(415, "Unsupported Media Type", image_url) from e
-            except Exception as e:
+                logger.error("Unsupported image format decoding from data URL")
+                raise HttpStatusError(415, "Unsupported Media Type", "data URL") from e
+            except OSError as e:
+                logger.error("Invalid image data decoding from data URL")
+                raise HttpStatusError(400, "Invalid image data", "data URL") from e
+            except ValueError as e:
                 if "Unsupported image format" in str(e):
-                    logger.error(f"Unsupported image format decoding: '{image_url}'")
+                    logger.error("Unsupported image format decoding from data URL")
                     raise HttpStatusError(
-                        415, "Unsupported Media Type", image_url
+                        415, "Unsupported Media Type", "data URL"
                     ) from e
-                logger.error(f"{type(e).__name__} decoding image: '{image_url}': {e}")
-                raise ValueError(f"Failed to decoding image: '{image_url}': {e}") from e
+                logger.error("Invalid image data in data URL: %s", e)
+                raise HttpStatusError(400, "Invalid image data", "data URL") from e
+            except Exception as e:
+                logger.error("%s decoding image from data URL: %s", type(e).__name__, e)
+                raise ValueError(f"Failed to decode image from data URL: {e}") from e
 
         # It's not file:, http:, https:, or data:
         raise ValueError(f"Invalid image source scheme: {parsed_url.scheme}")
@@ -297,9 +309,10 @@ class ImageLoader:
         for media_item, result in zip(image_mm_items, results):
             if isinstance(result, Exception):
                 source = media_item.get(URL_VARIANT_KEY, "decoded")
-                logger.error(f"Failed to load image from {source[:80]}...: {result}")
+                source_kind = "decoded media" if source == "decoded" else "media URL"
+                logger.error("Failed to load image from %s: %s", source_kind, result)
                 collective_exceptions += (
-                    f"Failed to load image from {source[:80]}...: {result}\n"
+                    f"Failed to load image from {source_kind}: {result}\n"
                 )
                 # Preserve HTTP status semantics (e.g. 415 Unsupported Media Type).
                 # Folding an HttpStatusError into a generic Exception below would
