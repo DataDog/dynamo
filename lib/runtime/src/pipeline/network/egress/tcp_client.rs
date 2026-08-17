@@ -432,6 +432,8 @@ fn build_request_plane_tls_connector(
     let tls_config =
         crate::tls_utils::client_tls_config(ca_cert_path, insecure, client_cert, client_key)?;
     Ok(Some(TlsConnector::from(std::sync::Arc::new(tls_config))))
+}
+
 impl Drop for TcpConnection {
     fn drop(&mut self) {
         self.healthy.store(false, Ordering::Relaxed);
@@ -721,15 +723,15 @@ impl TcpConnection {
                     return Err(e.into());
                 }
                 if let Err(e) = write_half.flush().await {
-                    send_buf.clear();
+                    write_buf.clear();
                     let err_msg = format!("Flush failed: {e}");
                     for tx in response_batch.drain(..) {
                         let _ = tx.send(Err(anyhow::anyhow!("{}", err_msg)));
                     }
                     return Err(e.into());
                 }
-                TCP_BYTES_SENT_TOTAL.inc_by(send_buf.len() as f64);
-                send_buf.clear(); // reset length, keep allocation for next batch
+                TCP_BYTES_SENT_TOTAL.inc_by(bytes_to_write as f64);
+                write_buf.clear(); // reset length, keep allocation for next batch
                 TCP_BYTES_SENT_TOTAL.inc_by(bytes_to_write as f64);
                 debug_assert!(write_buf.is_empty());
 
@@ -1687,11 +1689,9 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::task::{Context, Poll};
     use tempfile::NamedTempFile;
-    use tokio::io::AsyncReadExt;
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio_rustls::TlsAcceptor;
     use tokio::io::{AsyncReadExt, AsyncWrite};
     use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
 
     fn make_cert_files() -> (NamedTempFile, NamedTempFile) {
         let key_pair = rcgen::KeyPair::generate().unwrap();
