@@ -1100,11 +1100,15 @@ impl OpenAIPreprocessor {
                     // are client validation errors and should return 400, not 500.
                     // Note: We don't use .cause(e) because anyhow::Error doesn't implement
                     // std::error::Error in the way DynamoErrorBuilder::cause expects.
-                    DynamoError::builder()
-                        .error_type(ErrorType::InvalidArgument)
-                        .message(format!("Failed to apply prompt template: {e:#}"))
-                        .build()
-                        .into()
+                    // Use anyhow::Error::from(..) rather than .into(): the target type
+                    // can't be inferred early enough for .into() to resolve unambiguously
+                    // between the blanket identity impl and DynamoError's From impl.
+                    anyhow::Error::from(
+                        DynamoError::builder()
+                            .error_type(ErrorType::InvalidArgument)
+                            .message(format!("Failed to apply prompt template: {e:#}"))
+                            .build(),
+                    )
                 })?
         };
         TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
@@ -4150,6 +4154,32 @@ mod tests {
             b.multi_modal_data(Some(m));
         }
         b.build().unwrap()
+    }
+
+    // Regression test for a `.into()` ambiguity (E0283) that broke compilation:
+    // rustc couldn't resolve the target type between anyhow's blanket
+    // `From<E: std::error::Error>` impl and the reflexive `From<T> for T` impl.
+    // This mirrors the conversion used in `preprocess_request_with_options`'s
+    // template-error mapping, so it fails to compile if that pattern regresses.
+    #[test]
+    fn dynamo_error_converts_to_anyhow_error_preserving_invalid_argument() {
+        let template_err = anyhow::anyhow!("unexpected message role: tool");
+        let converted: anyhow::Error = anyhow::Error::from(
+            DynamoError::builder()
+                .error_type(ErrorType::InvalidArgument)
+                .message(format!("Failed to apply prompt template: {template_err:#}"))
+                .build(),
+        );
+
+        let dynamo_err = converted
+            .downcast_ref::<DynamoError>()
+            .expect("anyhow::Error should downcast back to DynamoError");
+        assert_eq!(dynamo_err.error_type(), ErrorType::InvalidArgument);
+        assert!(
+            dynamo_err
+                .message()
+                .contains("Failed to apply prompt template")
+        );
     }
 
     #[test]
