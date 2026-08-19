@@ -1100,9 +1100,9 @@ impl OpenAIPreprocessor {
                     // are client validation errors and should return 400, not 500.
                     // Note: We don't use .cause(e) because anyhow::Error doesn't implement
                     // std::error::Error in the way DynamoErrorBuilder::cause expects.
-                    // Use anyhow::Error::from(..) rather than .into(): the target type
-                    // can't be inferred early enough for .into() to resolve unambiguously
-                    // between the blanket identity impl and DynamoError's From impl.
+                    // Use anyhow::Error::from(..) rather than .into(): without an explicit target,
+                    // .into() can either keep the value as DynamoError (the reflexive From<T> for T)
+                    // or convert directly into anyhow::Error, causing an E0283 ambiguity.
                     anyhow::Error::from(
                         DynamoError::builder()
                             .error_type(ErrorType::InvalidArgument)
