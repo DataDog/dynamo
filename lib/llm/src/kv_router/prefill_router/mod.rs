@@ -5,7 +5,9 @@ use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
+use futures::stream;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use dynamo_kv_router::{
     PrefillLoadEstimator, config::RouterConfigOverride, protocols::RoutingConstraints,
@@ -22,10 +24,12 @@ use dynamo_runtime::{
 use crate::{
     discovery::ModelManager,
     protocols::common::{
+        extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
         llm_backend::{LLMEngineOutput, PreprocessedRequest},
         preprocessor::{BootstrapInfo, PrefillResult, TraceLink},
         timing::{RequestPhase, RequestTracker},
     },
+    session_affinity::AffinityTarget,
 };
 
 mod activation;
@@ -87,6 +91,21 @@ enum PrefillOutcome {
         worker_id: u64,
         worker_link: Option<TraceLink>,
     },
+    Terminal {
+        output: Box<Annotated<LLMEngineOutput>>,
+    },
+}
+
+fn extract_bootstrap_info(params: &serde_json::Value) -> Option<BootstrapInfo> {
+    let bootstrap_host = params.get("bootstrap_host")?.as_str()?.to_string();
+    let bootstrap_port = u16::try_from(params.get("bootstrap_port")?.as_u64()?).ok()?;
+    let bootstrap_room = params.get("bootstrap_room")?.as_u64()?;
+    Some(BootstrapInfo {
+        bootstrap_host,
+        bootstrap_port,
+        bootstrap_room,
+        handoff_id: Some(Uuid::new_v4()),
+    })
 }
 
 struct PreparedPrefill {
@@ -106,9 +125,23 @@ pub enum PrefillQueryOutcome {
     },
 }
 
-struct PrefillCompletion {
-    result: PrefillResult,
-    worker_link: Option<TraceLink>,
+enum PrefillCompletion {
+    Handoff {
+        result: PrefillResult,
+        worker_link: Option<TraceLink>,
+    },
+    Terminal {
+        output: Box<Annotated<LLMEngineOutput>>,
+    },
+}
+
+fn strip_terminal_disaggregated_params(
+    mut output: Annotated<LLMEngineOutput>,
+) -> Annotated<LLMEngineOutput> {
+    if let Some(data) = output.data.as_mut() {
+        data.disaggregated_params = None;
+    }
+    output
 }
 
 /// PrefillRouter is a forward-only operator that sits between Migration and the decode router.
@@ -125,15 +158,18 @@ pub struct PrefillRouter {
     endpoint_id: OnceLock<EndpointId>,
     cancel_token: CancellationToken,
     router_mode: RouterMode,
-    enforce_disagg: bool,
+    session_affinity_ttl: Option<std::time::Duration>,
     prefill_load_estimator: Option<Arc<dyn PrefillLoadEstimator>>,
     /// Model name (used for logging / lifecycle messages).
     model_name: String,
     /// Namespace (used for logging / lifecycle messages).
     namespace: String,
     is_eagle: bool,
+    task_guard: Option<dynamo_runtime::engine::EngineContextGuard>,
     /// Initialization and worker availability state.
     lifecycle: AtomicU8,
+    #[cfg(test)]
+    activation_task_state: Arc<()>,
 }
 
 impl Drop for PrefillRouter {
@@ -166,15 +202,16 @@ impl
         // Save original max_tokens for decode
         let original_max_tokens = req.stop_conditions.max_tokens;
 
-        // If prefill router is not activated (no prefill workers discovered) or has been
-        // deactivated (all prefill workers died), this is aggregated mode -- route directly
-        // to decode. With --enforce-disagg, fail instead of falling back.
+        // If the prefill router is not activated (no prefill workers discovered) or has been
+        // deactivated (all prefill workers died), route directly to the backend. Model admission
+        // remains gated by the registered worker topology before the request reaches this stage.
         if self.lifecycle_state() != PrefillLifecycleState::Active {
-            if self.enforce_disagg {
-                return Err(anyhow::anyhow!(PrefillError::NotActivated));
-            }
             return next.generate(context.map(|_| req)).await;
         }
+
+        let session_affinity = context
+            .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+            .map_err(|message| anyhow::anyhow!("invalid session affinity context: {message}"))?;
 
         // Ensure tracker exists for routing decisions in disaggregated mode.
         // Create one if not provided by the upstream DeltaGenerator.
@@ -198,26 +235,28 @@ impl
         if self.router_mode.is_direct_routing() && preselected_worker.is_none() {
             return Err(anyhow::anyhow!(
                 "Prefill worker ID required in Direct routing mode but none found in request. \
-                 Expected prefill_worker_id to be set via x-prefill-instance-id header by external router (e.g., EPP)."
+                 Expected prefill_worker_id to be set via x-dynamo-prefill-instance-id header by external router (e.g., EPP)."
             ));
         }
 
         let tracker = prefill_req.tracker.clone();
-        let prefill_context =
+        let mut prefill_context =
             Context::with_id_and_metadata(prefill_req, request_id.clone(), metadata.clone());
+        if let Some(session_affinity) = session_affinity {
+            prefill_context.insert(
+                SESSION_AFFINITY_CONTEXT_KEY,
+                session_affinity.as_ref().clone(),
+            );
+        }
         let router = self
             .prefill_router
             .get()
             .ok_or_else(|| anyhow::anyhow!(PrefillError::NotActivated))?;
         let prefill_result: Result<(PrefillOutcome, Option<RoutingConstraints>)> = async {
             let (prepared, prefill_stream) = router
-                .select_and_dispatch_prefill(
-                    prefill_context,
-                    preselected_worker,
-                    |request, worker_id, dp_rank| {
-                        self.prepare_prefill_dispatch(request, worker_id, dp_rank)
-                    },
-                )
+                .select_and_dispatch_prefill(prefill_context, |request, target| {
+                    self.prepare_prefill_dispatch(request, target)
+                })
                 .await?;
             let topology_constraints = prepared.topology_constraints;
             let outcome = if let Some(bootstrap_info) = prepared.bootstrap_info {
@@ -228,11 +267,31 @@ impl
                 }
             } else {
                 drop(prefill_phase_barrier);
-                let completion = Self::consume_prefill_stream(prefill_stream, tracker).await?;
-                PrefillOutcome::Completed {
-                    result: completion.result,
-                    worker_id: prepared.worker_id,
-                    worker_link: completion.worker_link,
+                let completion =
+                    Self::consume_prefill_stream(prefill_stream, tracker, self.task_guard.clone())
+                        .await?;
+
+                match completion {
+                    PrefillCompletion::Handoff {
+                        result,
+                        worker_link,
+                    } => {
+                        if let Some(bootstrap_info) =
+                            extract_bootstrap_info(&result.disaggregated_params)
+                        {
+                            PrefillOutcome::Bootstrap {
+                                bootstrap_info,
+                                worker_id: prepared.worker_id,
+                            }
+                        } else {
+                            PrefillOutcome::Completed {
+                                result,
+                                worker_id: prepared.worker_id,
+                                worker_link,
+                            }
+                        }
+                    }
+                    PrefillCompletion::Terminal { output } => PrefillOutcome::Terminal { output },
                 }
             };
             Ok((outcome, topology_constraints))
@@ -252,6 +311,21 @@ impl
                 }
                 return Err(error);
             }
+        };
+
+        // A prefill request can terminate before the backend establishes a KV
+        // handoff (for example, EOS on the one-token context step). Native
+        // disaggregated backends return that context response directly instead
+        // of launching a generation-only request with missing handoff IDs.
+        let outcome = match outcome {
+            PrefillOutcome::Terminal { output } => {
+                let output = strip_terminal_disaggregated_params(*output);
+                return Ok(dynamo_runtime::pipeline::ResponseStream::new(
+                    Box::pin(stream::once(async move { output })),
+                    engine_ctx,
+                ));
+            }
+            outcome => outcome,
         };
 
         // NVBugs 5969206: Do NOT abort decode routing when context is killed.
@@ -294,6 +368,9 @@ impl
                 decode_req.migration_link = worker_link;
                 decode_req.routing_mut().prefill_worker_id = Some(worker_id);
             }
+            PrefillOutcome::Terminal { .. } => {
+                unreachable!("terminal prefill outcomes return before decode routing")
+            }
         };
 
         if let Some(topology_constraints) = topology_constraints {
@@ -311,16 +388,12 @@ impl
 }
 
 impl PrefillRouter {
-    pub fn enforce_disagg(&self) -> bool {
-        self.enforce_disagg
-    }
-
     fn prepare_prefill_dispatch(
         &self,
         request: &mut PreprocessedRequest,
-        worker_id: u64,
-        dp_rank: Option<u32>,
+        target: AffinityTarget,
     ) -> anyhow::Result<PreparedPrefill> {
+        let AffinityTarget { worker_id, dp_rank } = target;
         let endpoint_id = self.endpoint_id.get();
         let topology_constraints =
             self.preflight_kv_transfer_constraints(endpoint_id, worker_id)?;
@@ -343,9 +416,9 @@ impl PrefillRouter {
                     bootstrap_host: host,
                     bootstrap_port: port,
                     bootstrap_room,
+                    handoff_id: Some(Uuid::new_v4()),
                 })
             });
-
         let routing = request.routing_mut();
         routing.prefill_worker_id = Some(worker_id);
         routing.prefill_dp_rank = dp_rank;
@@ -424,7 +497,10 @@ mod tests {
     use dynamo_kv_router::config::RouterConfigOverride;
     use std::collections::{HashMap, HashSet};
 
-    use crate::protocols::common::preprocessor::{PreprocessedRequest, RoutingHints};
+    use crate::protocols::common::{
+        FinishReason,
+        preprocessor::{PreprocessedRequest, RoutingHints},
+    };
 
     const MAX_ROOM: u64 = i64::MAX as u64;
 
@@ -439,6 +515,27 @@ mod tests {
         assert_eq!(override_config.assume_kv_reuse, Some(false));
         assert_eq!(override_config.track_prefill_tokens, Some(false));
         assert_eq!(override_config.router_temperature, Some(0.7));
+    }
+
+    #[test]
+    fn terminal_response_strips_disaggregated_params() {
+        let output = Annotated::from_data(LLMEngineOutput {
+            token_ids: vec![2],
+            finish_reason: Some(FinishReason::EoS),
+            disaggregated_params: Some(serde_json::json!({
+                "ctx_request_id": null,
+                "request_type": "context_only",
+            })),
+            ..Default::default()
+        });
+
+        let output = strip_terminal_disaggregated_params(output);
+        let data = output
+            .data
+            .expect("terminal response should retain its data");
+        assert_eq!(data.token_ids, vec![2]);
+        assert_eq!(data.finish_reason, Some(FinishReason::EoS));
+        assert!(data.disaggregated_params.is_none());
     }
 
     #[test]
@@ -533,60 +630,75 @@ mod tests {
         }
     }
 
-    fn make_test_router(enforce_disagg: bool) -> Arc<PrefillRouter> {
+    fn make_test_router() -> Arc<PrefillRouter> {
         PrefillRouter::disabled(
             Arc::new(crate::discovery::ModelManager::new()),
             RouterMode::RoundRobin,
-            enforce_disagg,
+            None,
         )
     }
 
-    #[test]
-    fn pending_state_uses_aggregated_fallback_only_when_allowed() {
-        let strict = make_test_router(true);
-        let fallback = make_test_router(false);
+    #[tokio::test]
+    async fn dropping_pending_router_releases_activation_task() {
+        let (_activation_tx, activation_rx) = tokio::sync::oneshot::channel();
+        let router = PrefillRouter::new(
+            activation_rx,
+            Arc::new(crate::discovery::ModelManager::new()),
+            RouterMode::RoundRobin,
+            16,
+            None,
+            None,
+            None,
+            "test-model".to_string(),
+            "test-namespace".to_string(),
+            false,
+            None,
+            None,
+        );
+        let task_state = Arc::downgrade(&router.activation_task_state);
+        let weak = Arc::downgrade(&router);
 
-        for router in [&strict, &fallback] {
-            assert_eq!(router.lifecycle_state(), PrefillLifecycleState::Pending);
-            assert!(!router.is_activated());
-            assert!(!router.is_deactivated());
-        }
-        assert!(!strict.can_serve_requests());
-        assert!(fallback.can_serve_requests());
+        drop(router);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while weak.strong_count() != 0 || task_state.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending activation task retained its PrefillRouter");
     }
 
     #[test]
-    fn active_state_serves_strict_and_fallback_routers() {
-        for enforce_disagg in [true, false] {
-            let router = make_test_router(enforce_disagg);
-            router.mark_active_for_test();
-
-            assert_eq!(router.lifecycle_state(), PrefillLifecycleState::Active);
-            assert!(!router.is_deactivated());
-            assert!(router.can_serve_requests());
-        }
+    fn pending_state_is_tracked() {
+        let router = make_test_router();
+        assert_eq!(router.lifecycle_state(), PrefillLifecycleState::Pending);
+        assert!(!router.is_activated());
+        assert!(!router.is_deactivated());
     }
 
     #[test]
-    fn unavailable_state_blocks_strict_and_allows_aggregated_fallback() {
-        let strict = make_test_router(true);
-        let fallback = make_test_router(false);
-        strict.mark_active_for_test();
-        fallback.mark_active_for_test();
-        strict.deactivate();
-        fallback.deactivate();
+    fn active_state_is_tracked() {
+        let router = make_test_router();
+        router.mark_active_for_test();
 
-        for router in [&strict, &fallback] {
-            assert_eq!(router.lifecycle_state(), PrefillLifecycleState::Unavailable);
-            assert!(router.is_deactivated());
-        }
-        assert!(!strict.can_serve_requests());
-        assert!(fallback.can_serve_requests());
+        assert_eq!(router.lifecycle_state(), PrefillLifecycleState::Active);
+        assert!(!router.is_deactivated());
+    }
+
+    #[test]
+    fn unavailable_state_is_tracked() {
+        let router = make_test_router();
+        router.mark_active_for_test();
+        router.deactivate();
+
+        assert_eq!(router.lifecycle_state(), PrefillLifecycleState::Unavailable);
+        assert!(router.is_deactivated());
     }
 
     #[test]
     fn deactivation_is_idempotent() {
-        let router = make_test_router(true);
+        let router = make_test_router();
         router.mark_active_for_test();
         router.deactivate();
         router.deactivate();
@@ -595,7 +707,7 @@ mod tests {
 
     #[test]
     fn pending_router_latches_worker_availability_transitions() {
-        let router = make_test_router(true);
+        let router = make_test_router();
         router.deactivate();
         assert_eq!(router.lifecycle_state(), PrefillLifecycleState::Unavailable);
 
@@ -607,7 +719,7 @@ mod tests {
 
     #[test]
     fn activation_does_not_overwrite_latched_deactivation() {
-        let router = make_test_router(true);
+        let router = make_test_router();
         router.deactivate();
 
         assert_eq!(
@@ -632,5 +744,43 @@ mod tests {
             Ok(PrefillLifecycleState::Unavailable)
         );
         assert_eq!(PrefillLifecycleState::try_from(3), Err(3));
+    }
+
+    #[test]
+    fn extract_bootstrap_info_parses_valid_params() {
+        let params = serde_json::json!({
+            "bootstrap_host": "10.0.0.5",
+            "bootstrap_port": 12345,
+            "bootstrap_room": 987654321u64,
+            // extra fields (e.g. worker_id) must be ignored
+            "worker_id": {"prefill_worker_id": 7},
+        });
+        let info = extract_bootstrap_info(&params).expect("valid params should parse");
+        assert_eq!(info.bootstrap_host, "10.0.0.5");
+        assert_eq!(info.bootstrap_port, 12345);
+        assert_eq!(info.bootstrap_room, 987654321);
+    }
+
+    #[test]
+    fn extract_bootstrap_info_none_when_field_missing() {
+        // Missing bootstrap_room -> not the bootstrap path (falls through to Completed).
+        let missing_room = serde_json::json!({
+            "bootstrap_host": "10.0.0.5",
+            "bootstrap_port": 12345,
+        });
+        assert!(extract_bootstrap_info(&missing_room).is_none());
+        // An aggregated / vLLM completed prefill carries no bootstrap fields.
+        assert!(extract_bootstrap_info(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn extract_bootstrap_info_rejects_out_of_range_port() {
+        // bootstrap_port must fit in u16 -> reject rather than silently truncating.
+        let params = serde_json::json!({
+            "bootstrap_host": "h",
+            "bootstrap_port": 70000,
+            "bootstrap_room": 1,
+        });
+        assert!(extract_bootstrap_info(&params).is_none());
     }
 }

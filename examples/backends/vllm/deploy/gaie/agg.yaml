@@ -43,12 +43,10 @@ spec:
             value: "128"
           - name: DYN_MODEL_NAME
             value: Qwen/Qwen3-0.6B
-          - name: DYN_ENFORCE_DISAGG
-            value: "false"
           envFrom:
           - secretRef:
               name: hf-token-secret
-          image: nvcr.io/nvidia/ai-dynamo/epp-image:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/epp-image:1.4.0
   - name: VllmDecodeWorker
     type: decode
     replicas: 1
@@ -75,7 +73,7 @@ spec:
           envFrom:
           - secretRef:
               name: hf-token-secret
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.0
           resources:
             limits:
               nvidia.com/gpu: "1"
@@ -91,4 +89,4 @@ spec:
           envFrom:
           - secretRef:
               name: hf-token-secret
-          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:my-tag
+          image: nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.0

@@ -23,6 +23,7 @@ use crate::pipeline::network::NetworkStreamWrapper;
 use crate::pipeline::network::PendingConnections;
 use crate::pipeline::network::RegisteredStream;
 use crate::pipeline::network::RequestControlMessage;
+use crate::pipeline::network::RequestPlanePayloadCodec;
 use crate::pipeline::network::RequestType;
 use crate::pipeline::network::ResponseType;
 use crate::pipeline::network::StreamOptions;
@@ -54,6 +55,7 @@ fn decode_response_stream<U>(
     queue_start: Instant,
     tx_start: Instant,
     inflight_guard: InflightGuard,
+    payload_codec: RequestPlanePayloadCodec,
 ) -> ManyOut<U>
 where
     U: Data + for<'de> Deserialize<'de> + MaybeError,
@@ -76,7 +78,7 @@ where
                 );
                 return Some(U::from_err(err));
             }
-            match serde_json::from_slice::<NetworkStreamWrapper<U>>(&res_bytes) {
+            match payload_codec.decode::<NetworkStreamWrapper<U>>(&res_bytes) {
                 Ok(item) => {
                     is_complete_final = item.complete_final;
                     if let Some(data) = item.data {
@@ -90,8 +92,13 @@ where
                     }
                 }
                 Err(err) => {
-                    let json_str = String::from_utf8_lossy(&res_bytes);
-                    tracing::warn!(%err, %json_str, "Failed deserializing JSON to response");
+                    let response_bytes_len = res_bytes.len();
+                    tracing::warn!(
+                        %err,
+                        codec = payload_codec.name(),
+                        response_bytes_len,
+                        "failed deserializing request-plane response"
+                    );
                     Some(U::from_err(DynamoError::msg(err.to_string())))
                 }
             }
@@ -141,9 +148,10 @@ fn build_request_envelope<T>(
     recv_conn_info: ConnectionInfo,
     send_conn_info: Option<ConnectionInfo>,
     request: Option<&T>,
+    payload_codec: RequestPlanePayloadCodec,
 ) -> Result<bytes::Bytes, Error>
 where
-    T: serde::Serialize + ?Sized,
+    T: serde::Serialize,
 {
     let request_id = context.id();
     let request_type = if send_conn_info.is_some() {
@@ -155,6 +163,7 @@ where
         id: request_id.to_string(),
         request_type,
         response_type: ResponseType::ManyOut,
+        payload_codec,
         connection_info: recv_conn_info,
         metadata: context.metadata().clone(),
         frontend_send_ts_ns: None,
@@ -163,7 +172,7 @@ where
 
     let ctrl = serialize_control_message(&control_message)?;
     let data: Option<Vec<u8>> = match request {
-        Some(req) => Some(serde_json::to_vec(req)?),
+        Some(req) => Some(payload_codec.encode(req)?),
         None => None,
     };
 
@@ -192,6 +201,12 @@ where
     Ok(buffer)
 }
 
+fn payload_codec_for_worker(instance: Option<&Instance>) -> RequestPlanePayloadCodec {
+    instance
+        .and_then(|instance| instance.request_plane_codec)
+        .unwrap_or(RequestPlanePayloadCodec::Json)
+}
+
 /// Await the network request-stream dial-in (if `request_stream_provider` is `Some`)
 /// and spawn a detached task that forwards every item from `input_stream` onto
 /// the request stream. Returns once the forwarder is spawned; `Err` if request-stream
@@ -200,6 +215,7 @@ async fn spawn_request_stream_forwarder<T>(
     request_stream_provider: Option<StreamProvider<StreamSender>>,
     mut input_stream: crate::engine::DataStream<T>,
     engine_ctx: Arc<dyn crate::engine::AsyncEngineContext>,
+    payload_codec: RequestPlanePayloadCodec,
 ) -> Result<(), Error>
 where
     T: serde::Serialize + Send + 'static,
@@ -244,7 +260,7 @@ where
                     None => break,
                 },
             };
-            let bytes = match serde_json::to_vec(&item) {
+            let bytes = match payload_codec.encode(&item) {
                 Ok(b) => b,
                 Err(e) => {
                     // Stream-side framing failure: the engine sees a
@@ -253,6 +269,7 @@ where
                     // dropping frames.
                     tracing::error!(
                         error = %e,
+                        codec = payload_codec.name(),
                         "failed to serialize bidirectional request frame; killing context"
                     );
                     engine_ctx.kill();
@@ -470,6 +487,7 @@ impl AddressedPushRouter {
         let inflight_guard = InflightGuard::new();
 
         let enable_request_stream = input_stream.is_some();
+        let payload_codec = payload_codec_for_worker(instance);
 
         // Hold the `RegisteredStream` as their RAII cleanup stays armed while held,
         // which simplifies the cancellation of registration on error. Each side is
@@ -513,6 +531,7 @@ impl AddressedPushRouter {
             recv_registered.connection_info.clone(),
             send_registered.as_ref().map(|r| r.connection_info.clone()),
             request,
+            payload_codec,
         )?;
         REQUEST_PLANE_QUEUE_SECONDS.observe(queue_start.elapsed().as_secs_f64());
 
@@ -520,15 +539,15 @@ impl AddressedPushRouter {
         let request_plane_response = self.dispatch_buffer(address, buffer, context.id()).await?;
         REQUEST_PLANE_SEND_SECONDS.observe(tx_start.elapsed().as_secs_f64());
 
-        // A worker load-shed surfaces on the request-plane ACK, not the response
-        // stream. Short-circuit with ResourceExhausted before waiting on a
-        // response-plane connection the worker will never open; returning early
-        // drops `recv_registered` and `inflight_guard` (their Drop cleans up).
-        if let Some(err) = detect_worker_overload_response(&request_plane_response) {
+        // A worker rejection surfaces on the request-plane ACK, not the response
+        // stream. Short-circuit before waiting on a response-plane connection the
+        // worker will never open; returning early drops `recv_registered` and
+        // `inflight_guard` (their Drop cleans up).
+        if let Some(err) = detect_worker_rejection_response(&request_plane_response) {
             tracing::warn!(
                 request_id = context.id(),
                 worker_response = %err.to_string(),
-                "Request rejected by worker (at capacity) — returning HTTP 503"
+                "Request rejected by worker"
             );
             return Err(err.into());
         }
@@ -543,8 +562,13 @@ impl AddressedPushRouter {
                 let (_conn_info, provider) = r.into_parts();
                 provider
             });
-            spawn_request_stream_forwarder(request_stream_provider, stream, engine_ctx.clone())
-                .await?;
+            spawn_request_stream_forwarder(
+                request_stream_provider,
+                stream,
+                engine_ctx.clone(),
+                payload_codec,
+            )
+            .await?;
         }
 
         let _nvtx_wait = dynamo_nvtx_range!("transport.tcp.wait_backend");
@@ -592,6 +616,7 @@ impl AddressedPushRouter {
             queue_start,
             tx_start,
             inflight_guard,
+            payload_codec,
         ))
     }
 
@@ -644,8 +669,8 @@ impl AddressedPushRouter {
     /// request-plane client.
     ///
     /// Returns the request-plane ACK bytes (empty `TcpResponseMessage` on the
-    /// success path; an overload-marker payload when the worker load-shed the
-    /// request — see [`detect_worker_overload_response`]).
+    /// success path; a rejection-marker payload when the worker rejects the
+    /// request — see [`detect_worker_rejection_response`]).
     async fn dispatch_buffer(
         &self,
         address: String,
@@ -671,33 +696,36 @@ impl AddressedPushRouter {
     }
 }
 
-/// Map a worker load-shed ACK (prefixed by a known overload marker, see
-/// `shared_tcp_endpoint.rs`) to `ResourceExhausted` so the HTTP layer returns
-/// 503. `None` for normal responses, including the empty "queued" ACK.
-fn detect_worker_overload_response(res_bytes: &[u8]) -> Option<DynamoError> {
+/// Map a worker rejection ACK to the corresponding typed error. `None` for
+/// normal responses, including the empty "queued" ACK.
+fn detect_worker_rejection_response(res_bytes: &[u8]) -> Option<DynamoError> {
     const OVERLOAD_PREFIX: &[u8] = b"Server overloaded:";
     const UNAVAILABLE_PREFIX: &[u8] = b"Server unavailable:";
 
-    if res_bytes.starts_with(OVERLOAD_PREFIX) || res_bytes.starts_with(UNAVAILABLE_PREFIX) {
-        let msg = String::from_utf8_lossy(res_bytes).into_owned();
-        Some(
-            DynamoError::builder()
-                .error_type(ErrorType::ResourceExhausted)
-                .message(msg)
-                .build(),
-        )
+    let error_type = if res_bytes.starts_with(OVERLOAD_PREFIX) {
+        ErrorType::ResourceExhausted
+    } else if res_bytes.starts_with(UNAVAILABLE_PREFIX) {
+        ErrorType::Unavailable
     } else {
-        None
-    }
+        return None;
+    };
+
+    let msg = String::from_utf8_lossy(res_bytes).into_owned();
+    Some(
+        DynamoError::builder()
+            .error_type(error_type)
+            .message(msg)
+            .build(),
+    )
 }
 
 #[cfg(test)]
-mod overload_detection_tests {
+mod rejection_detection_tests {
     use super::*;
 
     #[test]
     fn overload_payload_maps_to_resource_exhausted() {
-        let err = detect_worker_overload_response(b"Server overloaded: worker at capacity")
+        let err = detect_worker_rejection_response(b"Server overloaded: worker at capacity")
             .expect("should detect overload");
         assert_eq!(err.error_type(), ErrorType::ResourceExhausted);
     }
@@ -705,15 +733,15 @@ mod overload_detection_tests {
     #[test]
     fn empty_ack_is_not_overload() {
         // The success-path ACK is empty; misreading it as overload breaks every request.
-        assert!(detect_worker_overload_response(b"").is_none());
-        assert!(detect_worker_overload_response(br#"{"data":"chunk"}"#).is_none());
+        assert!(detect_worker_rejection_response(b"").is_none());
+        assert!(detect_worker_rejection_response(br#"{"data":"chunk"}"#).is_none());
     }
 
     #[test]
-    fn detected_error_satisfies_http_503_gate() {
-        // request_was_rejected (http/service/metrics.rs) → 503 keys on ResourceExhausted.
+    fn detected_overload_satisfies_http_529_gate() {
+        // request_was_rejected (http/service/metrics.rs) → 529 keys on ResourceExhausted.
         let err =
-            detect_worker_overload_response(b"Server overloaded: test").expect("should detect");
+            detect_worker_rejection_response(b"Server overloaded: test").expect("should detect");
         let any_err: anyhow::Error = err.into();
         assert!(crate::error::match_error_chain(
             any_err.as_ref(),
@@ -747,9 +775,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_MESSAGE_MAX_BYTES, ConnectionInfo, RequestControlMessage, RequestType,
-        ResponseType, serialize_control_message,
+        CONTROL_MESSAGE_MAX_BYTES, ConnectionInfo, RequestControlMessage, RequestPlanePayloadCodec,
+        RequestType, ResponseType, TwoPartCodec, build_request_envelope, payload_codec_for_worker,
+        serialize_control_message,
     };
+    use crate::{
+        component::{Instance, TransportType},
+        pipeline::Context,
+    };
+    use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
 
     fn base_control_message(metadata: BTreeMap<String, String>) -> RequestControlMessage {
@@ -757,6 +791,7 @@ mod tests {
             id: "request-123".to_string(),
             request_type: RequestType::SingleIn,
             response_type: ResponseType::ManyOut,
+            payload_codec: RequestPlanePayloadCodec::Json,
             connection_info: ConnectionInfo {
                 transport: "tcp".to_string(),
                 info: "{}".to_string(),
@@ -765,6 +800,49 @@ mod tests {
             frontend_send_ts_ns: None,
             request_stream_connection_info: None,
         }
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+    struct TestRequest {
+        value: u64,
+    }
+
+    #[test]
+    fn legacy_worker_without_codec_metadata_receives_json() {
+        let worker = Instance {
+            component: "worker".to_string(),
+            endpoint: "generate".to_string(),
+            namespace: "default".to_string(),
+            instance_id: 42,
+            transport: TransportType::Nats("worker.generate".to_string()),
+            device_type: None,
+            request_plane_codec: None,
+        };
+        let payload_codec = payload_codec_for_worker(Some(&worker));
+        assert_eq!(payload_codec, RequestPlanePayloadCodec::Json);
+
+        let request = TestRequest { value: 123 };
+        let buffer = build_request_envelope(
+            &Context::new(()),
+            ConnectionInfo {
+                transport: "tcp".to_string(),
+                info: "{}".to_string(),
+            },
+            None,
+            Some(&request),
+            payload_codec,
+        )
+        .expect("legacy-worker request envelope should encode");
+        let message = TwoPartCodec::default()
+            .decode_message(buffer)
+            .expect("request envelope should decode");
+
+        let control: RequestControlMessage = serde_json::from_slice(&message.header).unwrap();
+        assert_eq!(control.payload_codec, RequestPlanePayloadCodec::Json);
+        assert_eq!(
+            serde_json::from_slice::<TestRequest>(&message.data).unwrap(),
+            request
+        );
     }
 
     #[test]

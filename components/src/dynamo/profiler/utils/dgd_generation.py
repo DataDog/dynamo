@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib
 import json
 import logging
 import os
 import uuid
+from collections.abc import Callable
 from typing import Any, Optional
 
 import numpy as np
@@ -38,6 +40,7 @@ from dynamo.planner.config.planner_config import (
     PlannerPreDeploymentSweepMode,
 )
 from dynamo.profiler.utils.config import DgdPlannerServiceConfig, set_argument_value
+from dynamo.profiler.utils.config_modifiers.trtllm import enable_trtllm_chunked_prefill
 from dynamo.profiler.utils.profile_common import (
     ProfilerOperationalConfig,
     derive_planner_image,
@@ -50,6 +53,19 @@ logger = logging.getLogger(__name__)
 
 # Path to mocker disagg config relative to workspace
 MOCKER_DISAGG_CONFIG_PATH = "examples/backends/mocker/deploy/disagg.yaml"
+
+
+def _load_latest_database_version() -> Optional[Callable[..., Optional[str]]]:
+    try:
+        perf_database = importlib.import_module("aiconfigurator_core.sdk.perf_database")
+    except ModuleNotFoundError as e:
+        if e.name != "aiconfigurator_core":
+            raise
+        return None
+    return perf_database.get_latest_database_version
+
+
+get_latest_database_version = _load_latest_database_version()
 
 # ConfigMap name prefixes (a 4-char UUID suffix is appended at runtime
 # so that multiple deployments in the same namespace don't collide)
@@ -82,17 +98,19 @@ def assemble_final_config(
 ) -> Any:
     """Apply Dynamo features to the picked DGD config via composable layers.
 
-    1. **Mocker** — swap the base to the mocker DGD template if enabled.
-    2. **vLLM self-benchmark** — when the resolved backend is vLLM, set
+    1. **TRT-LLM runtime defaults** — enable chunked prefill on generated
+       TRT-LLM workers so their token budget may be smaller than the request ISL.
+    2. **Mocker** — swap the base to the mocker DGD template if enabled.
+    3. **vLLM self-benchmark** — when the resolved backend is vLLM, set
        ``DYN_BENCHMARK_MODE`` on each worker so the ``get_perf_metrics``
        endpoint is populated at runtime. The planner consumes this as
        priority 1 of its bootstrap chain, superseding AIC and files.
-    3. **Planner** — inject the Planner service + planner-config ConfigMap.
+    4. **Planner** — inject the Planner service + planner-config ConfigMap.
        When ``aic_perf_model`` is given, it is embedded so the planner can
        initialize the Rust perf shim with native AIC identity. When
        ``aic_spec`` is given (rapid mode), it is embedded so the planner can
        run AIC interpolation at bootstrap if the endpoint is unavailable.
-    4. **Profile data** — attach interpolation-data ConfigMap when mocker
+    5. **Profile data** — attach interpolation-data ConfigMap when mocker
        or planner-thorough is enabled. The ConfigMap is only emitted when
        the picked config is disaggregated AND the interpolation NPZ files
        were produced on disk; rapid-mode deployments never emit it (the
@@ -106,7 +124,11 @@ def assemble_final_config(
     planner = is_planner_enabled(dgdr)
     profile = needs_profile_data(dgdr)
 
+    if not mocker and resolved_backend == "trtllm":
+        enable_trtllm_chunked_prefill(dgd_config)
+
     if not mocker and not planner:
+        apply_runtime_version_override(dgdr, dgd_config)
         return dgd_config
 
     # Save picked config for auditing
@@ -150,9 +172,22 @@ def assemble_final_config(
         if profile_cm:
             config_maps.append(profile_cm)
 
+    apply_runtime_version_override(dgdr, base)
     if config_maps:
         return config_maps + [base]
     return base
+
+
+def apply_runtime_version_override(dgdr, config_dict: dict) -> None:
+    """Apply the DGDR runtime version to every generated DGD service."""
+    override = dgdr.runtimeVersionOverride
+    if not override:
+        return
+
+    services = config_dict.get("spec", {}).get("services", {})
+    for service_config in services.values():
+        if isinstance(service_config, dict):
+            service_config["runtimeVersionOverride"] = override
 
 
 def _vllm_worker_roles() -> dict[str, str]:
@@ -666,10 +701,31 @@ def build_aic_perf_model_spec(
     if mode in ("decode", "agg", "disagg") and best_decode_pick is None:
         return None
 
+    if get_latest_database_version is None:
+        logger.warning(
+            "aiconfigurator-core is unavailable; Planner will use FPM regression "
+            "instead of native AIC estimates."
+        )
+        return None
+
+    backend_version = get_latest_database_version(
+        system=system,
+        backend=resolved_backend,
+    )
+    if backend_version is None:
+        logger.warning(
+            "No AIC performance database is available for system=%s, backend=%s; "
+            "Planner will use FPM regression instead of native AIC estimates.",
+            system,
+            resolved_backend,
+        )
+        return None
+
     return AICPerfModelSpec(
         hf_id=dgdr.model,
         system=system,
         backend=resolved_backend,
+        backend_version=backend_version,
         prefill_pick=best_prefill_pick,
         decode_pick=best_decode_pick,
     )

@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::protocols::TokenIdType;
-use crate::protocols::agents::{AgentContextHeaderValues, agent_context_header_values};
+use crate::protocols::agents::{
+    AgentContextHeaderValues, agent_context_header_values, session_affinity_header_value,
+};
 use crate::protocols::common::llm_backend::PromptLogprobs;
 use crate::protocols::common::timing::TimingInfo;
 
@@ -234,14 +236,20 @@ pub fn parse_nvext(raw: Option<serde_json::Value>) -> anyhow::Result<Option<NvEx
         .map_err(|err| anyhow::anyhow!("invalid nvext: {err}"))
 }
 
-pub const HEADER_WORKER_INSTANCE_ID: &str = "x-worker-instance-id";
-pub const HEADER_PREFILL_INSTANCE_ID: &str = "x-prefill-instance-id";
-pub const HEADER_DP_RANK: &str = "x-dp-rank";
-/// Alias for data-parallel rank routing.
-pub const HEADER_DP_RANK_ALIAS: &str = "x-data-parallel-rank";
-pub const HEADER_PREFILL_DP_RANK: &str = "x-prefill-dp-rank";
+pub const HEADER_WORKER_INSTANCE_ID: &str = "x-dynamo-worker-instance-id";
+pub const HEADER_PREFILL_INSTANCE_ID: &str = "x-dynamo-prefill-instance-id";
+pub const HEADER_DP_RANK: &str = "x-dynamo-dp-rank";
+pub const HEADER_PREFILL_DP_RANK: &str = "x-dynamo-prefill-dp-rank";
 pub const HEADER_REQUEST_PRIORITY: &str = "x-dynamo-request-priority";
 pub const HEADER_REQUEST_STRICT_PRIORITY: &str = "x-dynamo-request-strict-priority";
+pub const HEADER_TENANT_ID: &str = "x-tenant-id";
+// Compatibility aliases for the original unprefixed names. Future agents may remove these after
+// the deprecation window.
+pub const HEADER_WORKER_INSTANCE_ID_ALIAS: &str = "x-worker-instance-id";
+pub const HEADER_PREFILL_INSTANCE_ID_ALIAS: &str = "x-prefill-instance-id";
+pub const HEADER_DP_RANK_ALIAS: &str = "x-dp-rank";
+pub const HEADER_DATA_PARALLEL_RANK_ALIAS: &str = "x-data-parallel-rank";
+pub const HEADER_PREFILL_DP_RANK_ALIAS: &str = "x-prefill-dp-rank";
 const UNSET_DP_RANK_SENTINEL: u32 = u32::MAX;
 
 impl From<AgentContextHeaderValues> for AgentContext {
@@ -260,54 +268,84 @@ impl From<AgentContextHeaderValues> for AgentContext {
 
 pub const AGENT_CONTEXT_CONTEXT_KEY: &str = "dynamo.llm.agent_context";
 
+pub const SESSION_AFFINITY_CONTEXT_KEY: &str = "dynamo.llm.session_affinity";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAffinityId(String);
+
+impl SessionAffinityId {
+    pub(crate) fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub fn agent_context_from_headers(headers: &HeaderMap) -> Option<AgentContext> {
     agent_context_header_values(headers).map(AgentContext::from)
+}
+
+pub fn session_affinity_from_headers(headers: &HeaderMap) -> Option<SessionAffinityId> {
+    session_affinity_header_value(headers).map(SessionAffinityId::new)
 }
 
 /// Apply HTTP routing header overrides to nvext.
 ///
 /// Header mappings:
-/// - `x-worker-instance-id` -> `backend_instance_id` and `decode_worker_id`
-/// - `x-prefill-instance-id` -> `prefill_worker_id`
-/// - `x-dp-rank` -> `dp_rank` (decode worker's DP rank)
-/// - `x-prefill-dp-rank` -> `prefill_dp_rank`
+/// - `x-dynamo-worker-instance-id` -> `backend_instance_id` and `decode_worker_id`
+/// - `x-dynamo-prefill-instance-id` -> `prefill_worker_id`
+/// - `x-dynamo-dp-rank` -> `dp_rank` (decode worker's DP rank)
+/// - `x-dynamo-prefill-dp-rank` -> `prefill_dp_rank`
 /// - `x-dynamo-request-priority` -> `agent_hints.priority`
 /// - `x-dynamo-request-strict-priority` -> `agent_hints.strict_priority`
+/// - `x-tenant-id` -> `cache_salt`
 ///
 /// Routing headers take priority over existing nvext values when present.
 /// If no headers are present, returns the original nvext unchanged.
 pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap) -> Option<NvExt> {
     let worker_id = headers
         .get(HEADER_WORKER_INSTANCE_ID)
+        .or_else(|| headers.get(HEADER_WORKER_INSTANCE_ID_ALIAS))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
     let prefill_id = headers
         .get(HEADER_PREFILL_INSTANCE_ID)
+        .or_else(|| headers.get(HEADER_PREFILL_INSTANCE_ID_ALIAS))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
     let dp_rank = headers
         .get(HEADER_DP_RANK)
         .or_else(|| headers.get(HEADER_DP_RANK_ALIAS))
+        .or_else(|| headers.get(HEADER_DATA_PARALLEL_RANK_ALIAS))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok());
 
     let prefill_dp_rank = headers
         .get(HEADER_PREFILL_DP_RANK)
+        .or_else(|| headers.get(HEADER_PREFILL_DP_RANK_ALIAS))
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u32>().ok());
     let prefill_dp_rank = prefill_dp_rank.filter(|rank| *rank != UNSET_DP_RANK_SENTINEL);
 
-    let priority = headers
+    let priority_header = headers
         .get(HEADER_REQUEST_PRIORITY)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<i32>().ok());
-
-    let strict_priority = headers
+        .and_then(|v| v.to_str().ok());
+    let strict_priority_header = headers
         .get(HEADER_REQUEST_STRICT_PRIORITY)
+        .and_then(|v| v.to_str().ok());
+    // Parsed only for the "header present?" gate below; the merge is delegated to
+    // `resolve_request_priority`.
+    let priority = priority_header.and_then(|s| s.trim().parse::<i32>().ok());
+    let strict_priority = strict_priority_header.and_then(|s| s.trim().parse::<u32>().ok());
+    let tenant_id = headers
+        .get(HEADER_TENANT_ID)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u32>().ok());
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
 
     if worker_id.is_none()
         && prefill_id.is_none()
@@ -315,6 +353,7 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
         && prefill_dp_rank.is_none()
         && priority.is_none()
         && strict_priority.is_none()
+        && tenant_id.is_none()
     {
         return nvext;
     }
@@ -334,15 +373,58 @@ pub fn apply_header_routing_overrides(nvext: Option<NvExt>, headers: &HeaderMap)
         ext.prefill_dp_rank = Some(rank);
     }
     if priority.is_some() || strict_priority.is_some() {
+        // Bake the effective header-over-body priority into the body.
+        let resolved = resolve_request_priority(
+            ext.agent_hints.as_ref(),
+            priority_header,
+            strict_priority_header,
+        );
         let hints = ext.agent_hints.get_or_insert_with(AgentHints::default);
-        if let Some(priority) = priority {
-            hints.priority = Some(priority);
-        }
-        if let Some(strict_priority) = strict_priority {
-            hints.strict_priority = Some(strict_priority);
-        }
+        hints.priority = resolved.priority;
+        hints.strict_priority = resolved.strict_priority;
+    }
+    if let Some(salt) = tenant_id {
+        ext.cache_salt = Some(salt);
     }
     Some(ext)
+}
+
+/// Priority resolved with header-over-body precedence, per field: a well-formed
+/// header (incl. `0`/negative) wins; a missing/malformed one falls back to the
+/// body; `latency_sensitivity` feeds only `priority_jump`, only when no priority
+/// exists. Transport-neutral — the caller passes header strings from an
+/// `http::HeaderMap` or Envoy `ext_proc` headers, so one policy serves both.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ResolvedPriority {
+    /// Effective `x-dynamo-request-priority`.
+    pub priority: Option<i32>,
+    /// Effective `x-dynamo-request-strict-priority` (queue tier).
+    pub strict_priority: Option<u32>,
+    /// `priority` as `f64`, else deprecated `latency_sensitivity`, else `None`.
+    pub priority_jump: Option<f64>,
+}
+
+/// Resolve request priority from body hints and already-looked-up raw header
+/// values. See [`ResolvedPriority`] for the precedence contract.
+pub fn resolve_request_priority(
+    hints: Option<&AgentHints>,
+    priority_header: Option<&str>,
+    strict_priority_header: Option<&str>,
+) -> ResolvedPriority {
+    let priority = priority_header
+        .and_then(|h| h.trim().parse::<i32>().ok())
+        .or_else(|| hints.and_then(|h| h.priority));
+    let strict_priority = strict_priority_header
+        .and_then(|h| h.trim().parse::<u32>().ok())
+        .or_else(|| hints.and_then(|h| h.strict_priority));
+    let priority_jump = priority
+        .map(|p| p as f64)
+        .or_else(|| hints.and_then(|h| h.latency_sensitivity));
+    ResolvedPriority {
+        priority,
+        strict_priority,
+        priority_jump,
+    }
 }
 
 pub trait NvExtProvider {
@@ -351,6 +433,26 @@ pub trait NvExtProvider {
     fn unsupported_fields(&self) -> Option<&std::collections::HashMap<String, serde_json::Value>> {
         None
     }
+}
+
+/// Return the request's non-empty cache salt using Dynamo's public precedence rules.
+///
+/// `nvext.cache_salt` is the canonical input. The top-level `cache_salt` field remains a
+/// compatibility fallback for request types that retain unsupported OpenAI fields. Empty strings
+/// are treated as absent so an empty canonical value can still fall back to a non-empty legacy
+/// value.
+pub fn request_cache_salt<R: NvExtProvider>(request: &R) -> Option<&str> {
+    request
+        .nvext()
+        .and_then(|nvext| nvext.cache_salt.as_deref())
+        .filter(|salt| !salt.is_empty())
+        .or_else(|| {
+            request
+                .unsupported_fields()
+                .and_then(|fields| fields.get("cache_salt"))
+                .and_then(|value| value.as_str())
+                .filter(|salt| !salt.is_empty())
+        })
 }
 
 pub fn routing_constraints_to_kv(
@@ -591,10 +693,56 @@ pub(crate) fn validate_completion_token_ids_single_choice(
 mod tests {
     use super::*;
     use crate::protocols::agents::{
-        HEADER_CLAUDE_CODE_AGENT_ID, HEADER_CLAUDE_CODE_SESSION_ID, HEADER_CODEX_SESSION_ID,
-        HEADER_DYNAMO_PARENT_SESSION_ID, HEADER_DYNAMO_SESSION_FINAL, HEADER_DYNAMO_SESSION_ID,
-        HEADER_OPENCODE_PARENT_SESSION_ID, HEADER_OPENCODE_SESSION_ID,
+        HEADER_CLAUDE_CODE_AGENT_ID, HEADER_CLAUDE_CODE_PARENT_AGENT_ID,
+        HEADER_CLAUDE_CODE_SESSION_ID, HEADER_CODEX_SESSION_ID, HEADER_DYNAMO_PARENT_SESSION_ID,
+        HEADER_DYNAMO_SESSION_FINAL, HEADER_DYNAMO_SESSION_ID, HEADER_OPENCODE_PARENT_SESSION_ID,
+        HEADER_OPENCODE_SESSION_ID,
     };
+
+    #[derive(Default)]
+    struct CacheSaltRequest {
+        nvext: Option<NvExt>,
+        unsupported_fields: HashMap<String, serde_json::Value>,
+    }
+
+    impl NvExtProvider for CacheSaltRequest {
+        fn nvext(&self) -> Option<&NvExt> {
+            self.nvext.as_ref()
+        }
+
+        fn raw_prompt(&self) -> Option<String> {
+            None
+        }
+
+        fn unsupported_fields(&self) -> Option<&HashMap<String, serde_json::Value>> {
+            Some(&self.unsupported_fields)
+        }
+    }
+
+    #[test]
+    fn request_cache_salt_uses_canonical_precedence_and_empty_fallbacks() {
+        let mut request = CacheSaltRequest::default();
+        assert_eq!(request_cache_salt(&request), None);
+
+        request
+            .unsupported_fields
+            .insert("cache_salt".to_string(), serde_json::json!("tenant-legacy"));
+        assert_eq!(request_cache_salt(&request), Some("tenant-legacy"));
+
+        request.nvext = Some(NvExt {
+            cache_salt: Some("tenant-nvext".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(request_cache_salt(&request), Some("tenant-nvext"));
+
+        request.nvext.as_mut().unwrap().cache_salt = Some(String::new());
+        assert_eq!(request_cache_salt(&request), Some("tenant-legacy"));
+
+        request
+            .unsupported_fields
+            .insert("cache_salt".to_string(), serde_json::json!(""));
+        assert_eq!(request_cache_salt(&request), None);
+    }
 
     #[test]
     fn shared_nvext_builder_default() {
@@ -727,6 +875,10 @@ mod tests {
         headers.insert(HEADER_PREFILL_INSTANCE_ID, "456".parse().unwrap());
         headers.insert(HEADER_DP_RANK, "3".parse().unwrap());
         headers.insert(HEADER_PREFILL_DP_RANK, "5".parse().unwrap());
+        headers.insert(HEADER_WORKER_INSTANCE_ID_ALIAS, "1".parse().unwrap());
+        headers.insert(HEADER_PREFILL_INSTANCE_ID_ALIAS, "2".parse().unwrap());
+        headers.insert(HEADER_DP_RANK_ALIAS, "4".parse().unwrap());
+        headers.insert(HEADER_PREFILL_DP_RANK_ALIAS, "6".parse().unwrap());
 
         let result = apply_header_routing_overrides(None, &headers).unwrap();
 
@@ -769,6 +921,105 @@ mod tests {
         assert_eq!(hints.priority, Some(-3));
         assert_eq!(hints.strict_priority, Some(2));
         assert_eq!(hints.osl, Some(99));
+    }
+
+    #[test]
+    fn resolve_request_priority_header_over_body_with_independent_fallback() {
+        let hints = AgentHints {
+            priority: Some(5),
+            strict_priority: Some(2),
+            latency_sensitivity: Some(1.5),
+            ..Default::default()
+        };
+
+        // Valid headers (including negative) override the body, per field.
+        let r = resolve_request_priority(Some(&hints), Some("-3"), Some("7"));
+        assert_eq!(r.priority, Some(-3));
+        assert_eq!(r.strict_priority, Some(7));
+        assert_eq!(r.priority_jump, Some(-3.0));
+
+        // Zero is a valid override, not "absent"; the other field falls back.
+        let r = resolve_request_priority(Some(&hints), Some("0"), None);
+        assert_eq!(r.priority, Some(0));
+        assert_eq!(r.priority_jump, Some(0.0));
+        assert_eq!(r.strict_priority, Some(2));
+
+        // Malformed/missing headers fall back to the body, independently.
+        let r = resolve_request_priority(Some(&hints), Some("abc"), None);
+        assert_eq!(r.priority, Some(5));
+        assert_eq!(r.strict_priority, Some(2));
+        assert_eq!(r.priority_jump, Some(5.0));
+
+        // `latency_sensitivity` drives `priority_jump` only when no priority exists.
+        let ls_only = AgentHints {
+            latency_sensitivity: Some(2.5),
+            ..Default::default()
+        };
+        let r = resolve_request_priority(Some(&ls_only), None, None);
+        assert_eq!(r.priority, None);
+        assert_eq!(r.priority_jump, Some(2.5));
+
+        // A real priority beats the deprecated `latency_sensitivity`.
+        let both = AgentHints {
+            priority: Some(4),
+            latency_sensitivity: Some(9.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_request_priority(Some(&both), None, None).priority_jump,
+            Some(4.0)
+        );
+
+        // Nothing set anywhere.
+        assert_eq!(
+            resolve_request_priority(None, None, None),
+            ResolvedPriority::default()
+        );
+    }
+
+    #[test]
+    fn apply_header_routing_overrides_sets_cache_salt_from_tenant_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_TENANT_ID, "tenant-a".parse().unwrap());
+
+        let nvext = apply_header_routing_overrides(None, &headers).unwrap();
+        assert_eq!(nvext.cache_salt.as_deref(), Some("tenant-a"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_TENANT_ID, "tenant-header".parse().unwrap());
+        let nvext = NvExt {
+            cache_salt: Some("tenant-body".to_string()),
+            ..Default::default()
+        };
+
+        let nvext = apply_header_routing_overrides(Some(nvext), &headers).unwrap();
+        assert_eq!(nvext.cache_salt.as_deref(), Some("tenant-header"));
+    }
+
+    #[test]
+    fn apply_header_routing_overrides_supports_unprefixed_aliases() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_WORKER_INSTANCE_ID_ALIAS, "123".parse().unwrap());
+        headers.insert(HEADER_PREFILL_INSTANCE_ID_ALIAS, "456".parse().unwrap());
+        headers.insert(HEADER_DP_RANK_ALIAS, "3".parse().unwrap());
+        headers.insert(HEADER_PREFILL_DP_RANK_ALIAS, "5".parse().unwrap());
+
+        let result = apply_header_routing_overrides(None, &headers).unwrap();
+
+        assert_eq!(result.backend_instance_id, Some(123));
+        assert_eq!(result.decode_worker_id, Some(123));
+        assert_eq!(result.prefill_worker_id, Some(456));
+        assert_eq!(result.dp_rank, Some(3));
+        assert_eq!(result.prefill_dp_rank, Some(5));
+
+        headers.remove(HEADER_DP_RANK_ALIAS);
+        headers.insert(HEADER_DATA_PARALLEL_RANK_ALIAS, "4".parse().unwrap());
+        assert_eq!(
+            apply_header_routing_overrides(None, &headers)
+                .unwrap()
+                .dp_rank,
+            Some(4)
+        );
     }
 
     #[test]
@@ -815,7 +1066,82 @@ mod tests {
     }
 
     #[test]
-    fn agent_context_from_headers_uses_claude_agent_id_as_child_session() {
+    fn session_affinity_prefers_dynamo_header_over_agent_mappings() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_CLAUDE_CODE_SESSION_ID,
+            "claude-session".parse().unwrap(),
+        );
+        headers.insert(HEADER_CODEX_SESSION_ID, "codex-session".parse().unwrap());
+        headers.insert(
+            HEADER_OPENCODE_SESSION_ID,
+            "opencode-session".parse().unwrap(),
+        );
+        // Without a canonical header, affinity falls back to the first matching
+        // agent mapping. Claude precedes Codex and OpenCode in AGENT_HEADER_MAPPINGS.
+        assert_eq!(
+            session_affinity_from_headers(&headers).unwrap().as_str(),
+            "claude-session"
+        );
+
+        // The explicit Dynamo session header always wins over agent mappings.
+        headers.insert(HEADER_DYNAMO_SESSION_ID, "canonical".parse().unwrap());
+        assert_eq!(
+            session_affinity_from_headers(&headers).unwrap().as_str(),
+            "canonical"
+        );
+
+        // A blank Dynamo header is ignored and affinity falls back to the mapping.
+        headers.insert(HEADER_DYNAMO_SESSION_ID, "   ".parse().unwrap());
+        assert_eq!(
+            session_affinity_from_headers(&headers).unwrap().as_str(),
+            "claude-session"
+        );
+    }
+
+    #[test]
+    fn session_affinity_uses_agent_child_session_when_present() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_CLAUDE_CODE_SESSION_ID,
+            "claude-session".parse().unwrap(),
+        );
+        headers.insert(HEADER_CLAUDE_CODE_AGENT_ID, "claude-agent".parse().unwrap());
+
+        // Affinity keys on the same id the agent context resolves to: the child
+        // (sub-agent) session when present, not the root session.
+        let agent_context = agent_context_from_headers(&headers).unwrap();
+        assert_eq!(agent_context.session_id, "claude-agent");
+        assert_eq!(
+            session_affinity_from_headers(&headers).unwrap().as_str(),
+            "claude-agent"
+        );
+
+        // The explicit Dynamo session header still takes precedence.
+        headers.insert(
+            HEADER_DYNAMO_SESSION_ID,
+            "affinity-session".parse().unwrap(),
+        );
+        let agent_context = agent_context_from_headers(&headers).unwrap();
+        assert_eq!(agent_context.session_id, "affinity-session");
+        assert_eq!(
+            session_affinity_from_headers(&headers).unwrap().as_str(),
+            "affinity-session"
+        );
+    }
+
+    #[test]
+    fn session_affinity_absent_without_any_session_header() {
+        let mut headers = HeaderMap::new();
+        assert!(session_affinity_from_headers(&headers).is_none());
+
+        // A blank canonical header with no agent headers yields no affinity.
+        headers.insert(HEADER_DYNAMO_SESSION_ID, "   ".parse().unwrap());
+        assert!(session_affinity_from_headers(&headers).is_none());
+    }
+
+    #[test]
+    fn agent_context_from_headers_uses_claude_agent_lineage() {
         let mut headers = HeaderMap::new();
         headers.insert(
             HEADER_CLAUDE_CODE_SESSION_ID,
@@ -830,6 +1156,23 @@ mod tests {
             agent_context.parent_session_id.as_deref(),
             Some("claude-session")
         );
+
+        headers.insert(
+            HEADER_CLAUDE_CODE_PARENT_AGENT_ID,
+            "claude-parent-agent".parse().unwrap(),
+        );
+        assert_eq!(
+            agent_context_from_headers(&headers)
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("claude-parent-agent")
+        );
+
+        headers.remove(HEADER_CLAUDE_CODE_AGENT_ID);
+        let root_context = agent_context_from_headers(&headers).unwrap();
+        assert_eq!(root_context.session_id, "claude-session");
+        assert_eq!(root_context.parent_session_id, None);
     }
 
     #[test]

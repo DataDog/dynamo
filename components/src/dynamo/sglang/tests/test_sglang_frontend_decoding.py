@@ -10,8 +10,12 @@ import pytest
 from PIL import Image
 
 from dynamo.common.constants import DisaggregationMode, EmbeddingTransferMode
+from dynamo.llm import HttpError
 from dynamo.sglang.backend_args import DynamoSGLangConfig
 from dynamo.sglang.request_handlers.llm.decode_handler import DecodeWorkerHandler
+from dynamo.sglang.request_handlers.multimodal.encode_worker_handler import (
+    MultimodalEncodeWorkerHandler,
+)
 
 pytestmark = [
     pytest.mark.unit,
@@ -60,6 +64,27 @@ def test_validate_accepts_frontend_decoding_alone():
     config.validate()
 
 
+@pytest.mark.asyncio
+async def test_encode_worker_rejects_unknown_oov_token_before_loading_media():
+    handler = MultimodalEncodeWorkerHandler.__new__(MultimodalEncodeWorkerHandler)
+    handler.image_token_id = 32000
+    handler.video_token_id = None
+    handler._max_input_token_id = 31999
+    handler._build_encode_inputs = AsyncMock()
+    raw_request = {
+        "token_ids": [1, 32000, 2**32 - 1],
+        "stop_conditions": {"max_tokens": 8},
+        "sampling_options": {"temperature": 0.0},
+        "multi_modal_data": {"image_url": [{"Url": "https://example.com/image.png"}]},
+    }
+
+    with pytest.raises(HttpError, match="4294967295"):
+        async for _ in handler.generate(raw_request, context=None):
+            pass
+
+    handler._build_encode_inputs.assert_not_awaited()
+
+
 class _Context:
     id_value: str = "test-request"
     trace_id: str = "test-trace"
@@ -97,7 +122,6 @@ def _new_decode_handler(*, enable_frontend_decoding: bool):
 
     handler._get_input_param = lambda req: {"input_ids": req.get("token_ids", [])}
     handler._resolve_lora = lambda req: None
-    handler._session_kwargs = lambda req: {}
     handler._priority_kwargs = lambda priority: {}
 
     return handler
@@ -109,8 +133,8 @@ async def _empty_stream() -> AsyncGenerator[Dict[str, Any], None]:
 
 
 @pytest.mark.asyncio
-async def test_aggregated_fd_off_passes_url_strings():
-    """Without --frontend-decoding, image_url items pass through as URL strings."""
+async def test_aggregated_fd_off_passes_media_url_strings():
+    """Without frontend decoding, media URL items pass through as strings."""
     handler = _new_decode_handler(enable_frontend_decoding=False)
 
     captured: Dict[str, Any] = {}
@@ -123,13 +147,17 @@ async def test_aggregated_fd_off_passes_url_strings():
 
     request = {
         "token_ids": [1, 2, 3],
-        "multi_modal_data": {"image_url": [{"Url": "https://example.com/a.jpg"}]},
+        "multi_modal_data": {
+            "image_url": [{"Url": "https://example.com/a.jpg"}],
+            "audio_url": [{"Url": "https://example.com/a.wav"}],
+        },
     }
 
     async for _ in handler.generate(request, _Context()):
         pass
 
     assert captured["image_data"] == ["https://example.com/a.jpg"]
+    assert captured["audio_data"] == ["https://example.com/a.wav"]
 
 
 @pytest.mark.asyncio

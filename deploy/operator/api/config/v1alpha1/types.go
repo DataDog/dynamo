@@ -152,15 +152,14 @@ type LeaderElectionConfiguration struct {
 
 // NamespaceConfiguration determines operator namespace mode.
 type NamespaceConfiguration struct {
-	// Deprecated: Namespace-restricted mode is deprecated and will be removed in a future release.
-	// Use cluster-wide mode (leave Restricted empty) instead.
+	// Restricted enables namespace-restricted mode for development and testing.
+	// Namespace-restricted mode is not supported for production.
 	Restricted string `json:"restricted"`
-	// Deprecated: Scope is only used in namespace-restricted mode, which is deprecated.
+	// Scope configures the namespace ownership claim in namespace-restricted mode.
 	Scope NamespaceScopeConfiguration `json:"scope"`
 }
 
-// Deprecated: NamespaceScopeConfiguration is used only by the deprecated namespace-restricted
-// mode and will be removed in a future release.
+// NamespaceScopeConfiguration configures the development/test namespace ownership claim.
 type NamespaceScopeConfiguration struct {
 	// LeaseDuration is the duration of namespace scope marker lease before expiration
 	// +kubebuilder:default="30s"
@@ -178,6 +177,8 @@ type OrchestratorConfiguration struct {
 	LWS LWSConfiguration `json:"lws"`
 	// KaiScheduler configuration
 	KaiScheduler KaiSchedulerConfiguration `json:"kaiScheduler"`
+	// VolcanoScheduler configuration
+	VolcanoScheduler VolcanoSchedulerConfiguration `json:"volcanoScheduler"`
 }
 
 // GroveConfiguration holds Grove orchestrator settings.
@@ -198,6 +199,12 @@ type LWSConfiguration struct {
 // KaiSchedulerConfiguration holds Kai-scheduler settings.
 type KaiSchedulerConfiguration struct {
 	// Enabled overrides auto-detection. nil = auto-detect.
+	Enabled *bool `json:"enabled,omitempty"`
+}
+
+// VolcanoSchedulerConfiguration holds Volcano scheduler settings.
+type VolcanoSchedulerConfiguration struct {
+	// EXPERIMENTAL: Enabled controls Volcano scheduler integration for Grove PodCliqueSets.
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
@@ -223,6 +230,26 @@ type DRAConfiguration struct {
 type InfrastructureConfiguration struct {
 	// NATSAddress is the address of the NATS server
 	NATSAddress string `json:"natsAddress"`
+	// NATSTLSCAPath is the path to the CA certificate used to verify the NATS server TLS
+	// certificate. When set, NATS_TLS_CA_CERT_PATH is injected into every DGD pod so clients
+	// can connect to a TLS-enabled NATS server without per-DGD configuration.
+	NATSTLSCAPath string `json:"natsTLSCAPath,omitempty"`
+	// NATSTLSClientCertPath is injected as NATS_TLS_CLIENT_CERT_PATH (client cert for NATS mTLS).
+	NATSTLSClientCertPath string `json:"natsTLSClientCertPath,omitempty"`
+	// NATSTLSClientKeyPath is injected as NATS_TLS_CLIENT_KEY_PATH (client key for NATS mTLS).
+	NATSTLSClientKeyPath string `json:"natsTLSClientKeyPath,omitempty"`
+	// TCPTLSCertPath is injected as DYN_TCP_TLS_CERT_PATH (frontend server cert).
+	TCPTLSCertPath string `json:"tcpTLSCertPath,omitempty"`
+	// TCPTLSKeyPath is injected as DYN_TCP_TLS_KEY_PATH (frontend server key).
+	TCPTLSKeyPath string `json:"tcpTLSKeyPath,omitempty"`
+	// TCPTLSCAPath is injected as DYN_TCP_TLS_CA_CERT_PATH (worker CA to verify frontend cert).
+	TCPTLSCAPath string `json:"tcpTLSCAPath,omitempty"`
+	// TCPTLSClientCertPath is injected as DYN_TCP_TLS_CLIENT_CERT_PATH (worker client cert for mTLS).
+	TCPTLSClientCertPath string `json:"tcpTLSClientCertPath,omitempty"`
+	// TCPTLSClientKeyPath is injected as DYN_TCP_TLS_CLIENT_KEY_PATH (worker client key for mTLS).
+	TCPTLSClientKeyPath string `json:"tcpTLSClientKeyPath,omitempty"`
+	// TCPTLSClientCAPath is injected as DYN_TCP_TLS_CLIENT_CA_CERT_PATH (frontend CA to verify worker client certs, mTLS).
+	TCPTLSClientCAPath string `json:"tcpTLSClientCAPath,omitempty"`
 	// ETCDAddress is the address of the etcd server
 	ETCDAddress string `json:"etcdAddress"`
 	// ModelExpressURL is the URL of the Model Express server to inject into all pods
@@ -261,6 +288,8 @@ const (
 // DestinationRules) for EPP components so that sidecar proxies connect
 // correctly without double-TLS issues.
 type ServiceMeshConfiguration struct {
+	// Enabled overrides service mesh auto-detection. nil = auto-detect.
+	Enabled *bool `json:"enabled,omitempty"`
 	// Provider selects the service mesh implementation. Supported: "istio", "".
 	// Empty string disables service mesh resource generation.
 	Provider string `json:"provider"`
@@ -268,8 +297,12 @@ type ServiceMeshConfiguration struct {
 	Istio *IstioMeshConfiguration `json:"istio,omitempty"`
 }
 
-// IsEnabled returns true if a supported service mesh provider is configured.
+// IsEnabled returns true if service mesh resources should be created or updated.
+// Cleanup of previously owned resources is handled separately during reconcile.
 func (s *ServiceMeshConfiguration) IsEnabled() bool {
+	if s.Enabled != nil && !*s.Enabled {
+		return false
+	}
 	return ServiceMeshProvider(s.Provider) == ServiceMeshProviderIstio
 }
 

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 try:
     from ._version import __version__
 except Exception:
@@ -17,7 +19,6 @@ __all__ = ["__version__"]
 
 try:
     from dynamo._core import MockEngineArgs as MockEngineArgs
-    from dynamo._core import PlannerReplayBridge as PlannerReplayBridge
     from dynamo._core import ReasoningConfig as ReasoningConfig
     from dynamo._core import SglangArgs as SglangArgs
     from dynamo._core import TrtllmArgs as TrtllmArgs
@@ -30,7 +31,6 @@ else:
     __all__.extend(
         [
             "MockEngineArgs",
-            "PlannerReplayBridge",
             "ReasoningConfig",
             "SglangArgs",
             "TrtllmArgs",
@@ -39,14 +39,14 @@ else:
     )
 
     def run_mocker_trace_replay(
-        trace_file,
+        trace_files,
         extra_engine_args=None,
         router_config=None,
         num_workers=1,
         replay_concurrency=None,
         router_mode="round_robin",
         arrival_speedup_ratio=1.0,
-        trace_block_size=512,
+        trace_block_size=None,
         trace_format="mooncake",
         trace_shared_prefix_ratio=0.0,
         trace_num_prefix_groups=0,
@@ -55,8 +55,12 @@ else:
         sla_itl_ms=None,
         sla_e2e_ms=None,
     ):
+        if isinstance(trace_files, (str, os.PathLike)):
+            trace_files = [trace_files]
+        else:
+            trace_files = list(trace_files)
         return _run_mocker_trace_replay(
-            trace_file,
+            trace_files,
             extra_engine_args=extra_engine_args,
             router_config=router_config,
             num_workers=num_workers,

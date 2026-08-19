@@ -229,7 +229,7 @@ impl ListenerLoop {
                     }
                 }
             };
-            if msg.len() < 3 {
+            if msg.len() != 4 {
                 tracing::warn!(
                     worker_id,
                     dp_rank,
@@ -239,12 +239,15 @@ impl ListenerLoop {
                 break;
             }
 
-            let payload = msg.get(2).expect("frame count checked above");
+            // vLLM replay responses include the DEALER identity delimiter plus the
+            // original PUB topic, so the payload shape is:
+            // [empty delimiter, topic, sequence number, encoded event batch].
+            let payload = msg.get(3).expect("frame count checked above");
             if payload.is_empty() {
                 break;
             }
 
-            let seq_bytes = msg.get(1).expect("frame count checked above");
+            let seq_bytes = msg.get(2).expect("frame count checked above");
             if seq_bytes.len() != 8 {
                 tracing::warn!(
                     worker_id,
@@ -312,8 +315,7 @@ impl ListenerLoop {
             }
             CursorObservation::Initial { .. }
             | CursorObservation::Contiguous { .. }
-            | CursorObservation::Stale { .. }
-            | CursorObservation::FreshAfterBarrier { .. } => {}
+            | CursorObservation::Stale { .. } => {}
         }
     }
 
@@ -534,28 +536,5 @@ async fn connect_replay_socket(
             );
             None
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{WATERMARK_UNSET, cursor_from_watermark};
-    use crate::recovery::CursorObservation;
-
-    #[test]
-    fn initial_gap_replays_from_zero_and_replayed_seq_becomes_stale() {
-        let replay_start = match cursor_from_watermark(WATERMARK_UNSET).observe(5) {
-            CursorObservation::Initial { got } if got > 0 => Some(0),
-            CursorObservation::Gap { expected, .. } => Some(expected),
-            _ => None,
-        };
-        assert_eq!(replay_start, Some(0));
-        assert!(matches!(
-            cursor_from_watermark(5).observe(5),
-            CursorObservation::Stale {
-                got: 5,
-                last_applied: Some(5),
-            }
-        ));
     }
 }
