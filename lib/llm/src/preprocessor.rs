@@ -1095,7 +1095,15 @@ impl OpenAIPreprocessor {
         let formatted_prompt = {
             let _nvtx = dynamo_nvtx_range!("preprocess.template");
             self.apply_template(request)
-                .with_context(|| "Failed to apply prompt template")?
+                .map_err(|e| {
+                    let msg = format!("Failed to apply prompt template: {e}");
+                    DynamoError::builder()
+                        .error_type(ErrorType::InvalidArgument)
+                        .message(msg)
+                        .cause(e)
+                        .build()
+                        .into()
+                })?
         };
         TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
 
