@@ -1096,11 +1096,13 @@ impl OpenAIPreprocessor {
             let _nvtx = dynamo_nvtx_range!("preprocess.template");
             self.apply_template(request)
                 .map_err(|e| {
-                    let msg = format!("Failed to apply prompt template: {e}");
+                    // Template rendering errors (e.g., invalid message role, malformed chat history)
+                    // are client validation errors and should return 400, not 500.
+                    // Note: We don't use .cause(e) because anyhow::Error doesn't implement
+                    // std::error::Error in the way DynamoErrorBuilder::cause expects.
                     DynamoError::builder()
                         .error_type(ErrorType::InvalidArgument)
-                        .message(msg)
-                        .cause(e)
+                        .message(format!("Failed to apply prompt template: {e:#}"))
                         .build()
                         .into()
                 })?
