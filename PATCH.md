@@ -67,6 +67,18 @@ based on upstream `release/1.4.0`. Replayed from the `v1.3.0` branch.
 | `10c938cf8b` | Potential fix for pull request finding |
 | `46b9023da0` | fix(runtime): reload TLS identities from content |
 
+## Error Handling Fixes
+
+| Commit | Purpose |
+|--------|---------|
+| `fe0e271` | fix(llm): return 400 for template validation errors instead of 500 |
+
+**Rationale:** Template rendering errors (e.g., "Unexpected message role", malformed
+chat history) are client validation failures and should return HTTP 400 Bad Request,
+not 500 Internal Server Error. This fix converts template errors to
+`DynamoError::InvalidArgument` so the HTTP layer correctly maps them to 400.
+Affects monitoring (4xx vs 5xx tracking), client retry behavior, and debugging.
+
 ## Notes
 
 - 3 merge commits (PRs #14, #15, #16) were skipped during cherry-pick as their
