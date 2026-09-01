@@ -109,6 +109,56 @@ fn invalid_argument_error(message: impl Into<String>) -> anyhow::Error {
         .into()
 }
 
+pub(crate) const EXTERNAL_IMAGE_URL_FETCH_ERROR: &str = "External image URLs cannot be fetched from the serving cluster. Provide image data as base64 instead.";
+
+fn is_external_image_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_connect)
+    })
+}
+
+fn map_external_image_fetch_error(error: anyhow::Error) -> anyhow::Error {
+    if is_external_image_connection_error(&error) {
+        tracing::warn!(
+            error = %error,
+            "external image URL connection failed; returning a client error"
+        );
+        invalid_argument_error(EXTERNAL_IMAGE_URL_FETCH_ERROR)
+    } else {
+        error
+    }
+}
+
+fn is_external_image_fetch_client_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<DynamoError>()
+            .is_some_and(|dynamo_error| {
+                dynamo_error.error_type() == ErrorType::InvalidArgument
+                    && dynamo_error.message() == EXTERNAL_IMAGE_URL_FETCH_ERROR
+            })
+    })
+}
+
+#[cfg(feature = "mm-routing")]
+#[derive(Debug, Clone)]
+enum ImageDimFetchError {
+    ExternalConnection,
+    Other(String),
+}
+
+#[cfg(feature = "mm-routing")]
+impl std::fmt::Display for ImageDimFetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ExternalConnection => f.write_str(EXTERNAL_IMAGE_URL_FETCH_ERROR),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
 fn tool_content_part_as_user(
     part: &ChatCompletionRequestToolMessageContentPart,
 ) -> Cow<'_, ChatCompletionRequestUserMessageContentPart> {
@@ -1583,11 +1633,12 @@ impl OpenAIPreprocessor {
         // ship a partial / misaligned UUID list to vLLM.
         //
         // The mismatch is only reachable on the URL-passthrough path
-        // (no media_loader): each `fetch_image_dims_uncached` failure logs
-        // a warn and skips its `mm_image_entries.push`, but doesn't abort
-        // the request. The decoded path (`has_media_loader`) propagates
-        // any dim-fetch failure via `?`, so the request errors out before
-        // mm_hashes forwarding is even considered.
+        // (no media_loader): non-connection `fetch_image_dims_uncached`
+        // failures log a warning and skip their `mm_image_entries.push`, but
+        // don't abort the request. External connection failures are request
+        // errors and abort with a typed 400. The decoded path
+        // (`has_media_loader`) also propagates failures, so the request errors
+        // out before mm_hashes forwarding is even considered.
         #[cfg(feature = "mm-routing")]
         let mut total_image_count: usize = 0;
         // For the URL-passthrough case (media_loader is None) we collect image
@@ -1677,7 +1728,13 @@ impl OpenAIPreprocessor {
 
             for (task, result) in fetch_tasks.into_iter().zip(results) {
                 // if one item fails, errors the whole request, other items will be cleaned up by Drop
-                let rdma_descriptor = result?;
+                let rdma_descriptor = match result {
+                    Ok(descriptor) => descriptor,
+                    Err(error) if task.modality == "image_url" => {
+                        return Err(map_external_image_fetch_error(error));
+                    }
+                    Err(error) => return Err(error),
+                };
 
                 // Decoded RDMA descriptor carries shape `[H, W, C]`.
                 // Image-only; MM-routing doesn't cover audio/video.
@@ -1773,6 +1830,9 @@ impl OpenAIPreprocessor {
                         });
                     }
                     Err(e) => {
+                        if is_external_image_fetch_client_error(&e) {
+                            return Err(e);
+                        }
                         // Redact `data:` URIs to just the media-type prefix —
                         // the comma-separated payload is the entire (base64)
                         // image body and ships in logs would be log bloat /
@@ -2100,10 +2160,27 @@ impl OpenAIPreprocessor {
             .try_get_with(mm_hash, async move {
                 Self::fetch_image_dims_uncached(&url_owned)
                     .await
-                    .map_err(|e| e.to_string())
+                    .map_err(|error| {
+                        if is_external_image_connection_error(&error) {
+                            tracing::warn!(
+                                error = %error,
+                                "external image URL connection failed during dimension fetch; returning a client error"
+                            );
+                            ImageDimFetchError::ExternalConnection
+                        } else {
+                            ImageDimFetchError::Other(error.to_string())
+                        }
+                    })
             })
             .await
-            .map_err(|e| anyhow::anyhow!("fetch_image_dims failed: {}", e))
+            .map_err(|error| match error.as_ref() {
+                ImageDimFetchError::ExternalConnection => {
+                    invalid_argument_error(EXTERNAL_IMAGE_URL_FETCH_ERROR)
+                }
+                ImageDimFetchError::Other(message) => {
+                    anyhow::anyhow!("fetch_image_dims failed: {message}")
+                }
+            })
     }
 
     #[cfg(feature = "mm-routing")]
@@ -4129,6 +4206,36 @@ mod tests {
     use super::*;
     use crate::protocols::common::preprocessor::MultimodalData;
     use crate::protocols::common::{OutputOptions, SamplingOptions, StopConditions};
+
+    #[tokio::test]
+    async fn external_image_connection_failure_is_invalid_argument() {
+        // Port zero cannot have a listening HTTP service. This produces a
+        // connection error without relying on DNS or external network access.
+        let connection_error = reqwest::Client::new()
+            .get("http://127.0.0.1:0/image.png")
+            .send()
+            .await
+            .expect_err("request should fail to connect");
+        assert!(connection_error.is_connect());
+
+        let error = map_external_image_fetch_error(connection_error.into());
+        assert!(is_external_image_fetch_client_error(&error));
+        let dynamo_error = error
+            .downcast_ref::<DynamoError>()
+            .expect("connection failures should become a typed client error");
+
+        assert_eq!(dynamo_error.error_type(), ErrorType::InvalidArgument);
+        assert_eq!(dynamo_error.message(), EXTERNAL_IMAGE_URL_FETCH_ERROR);
+    }
+
+    #[test]
+    fn unexpected_image_processing_failure_remains_internal() {
+        let error = map_external_image_fetch_error(anyhow::anyhow!("local decoder failure"));
+
+        assert!(!is_external_image_fetch_client_error(&error));
+        assert!(error.downcast_ref::<DynamoError>().is_none());
+        assert_eq!(error.to_string(), "local decoder failure");
+    }
 
     fn url_entry(u: &str) -> MultimodalData {
         MultimodalData::Url(url::Url::parse(u).unwrap())
