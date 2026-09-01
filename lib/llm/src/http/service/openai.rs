@@ -142,17 +142,9 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
     }
 }
 
-/// Classify error for metrics based on status code and message
-fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
+/// Classify errors for metrics from the HTTP status returned to the client.
+fn classify_error_for_metrics(code: StatusCode) -> ErrorType {
     match code {
-        StatusCode::BAD_REQUEST => {
-            // 400
-            if message.starts_with("Validation:") {
-                ErrorType::Validation
-            } else {
-                ErrorType::Internal
-            }
-        }
         StatusCode::NOT_FOUND => ErrorType::NotFound, // 404
         StatusCode::NOT_IMPLEMENTED => ErrorType::NotImplemented, // 501
         StatusCode::TOO_MANY_REQUESTS => ErrorType::Overload, // 429
@@ -167,7 +159,7 @@ fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
 
 /// Extract ErrorType from ErrorResponse for metrics
 fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
-    classify_error_for_metrics(response.0, &response.1.message)
+    classify_error_for_metrics(response.0)
 }
 
 fn responses_conversion_error_type(error: &anyhow::Error) -> ErrorType {
@@ -4764,6 +4756,30 @@ mod tests {
     }
 
     #[test]
+    fn external_image_connection_failure_returns_validation_400() {
+        use dynamo_runtime::error::{DynamoError, ErrorType as DynamoErrorType};
+
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(DynamoErrorType::InvalidArgument)
+            .message(crate::preprocessor::EXTERNAL_IMAGE_URL_FETCH_ERROR)
+            .build()
+            .into();
+
+        let response = ErrorMessage::from_anyhow(err, BACKUP_ERROR_MESSAGE);
+
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(response.1.code, StatusCode::BAD_REQUEST.as_u16());
+        assert_eq!(
+            response.1.message,
+            crate::preprocessor::EXTERNAL_IMAGE_URL_FETCH_ERROR
+        );
+        assert_eq!(
+            extract_error_type_from_response(&response),
+            ErrorType::Validation
+        );
+    }
+
+    #[test]
     fn test_backend_invalid_argument_surfaces_as_400() {
         // `Backend(InvalidArgument)` is what `py_err_to_dynamo` produces
         // for Python `ValueError` / `TypeError` raised inside an engine's
@@ -4810,8 +4826,7 @@ mod tests {
     #[test]
     fn test_cancelled_error_metrics_classification() {
         // HTTP 499 should be classified as Cancelled for metrics
-        let error_type =
-            classify_error_for_metrics(StatusCode::from_u16(499).unwrap(), "cancelled request");
+        let error_type = classify_error_for_metrics(StatusCode::from_u16(499).unwrap());
         assert_eq!(
             error_type,
             ErrorType::Cancelled,
@@ -5871,40 +5886,48 @@ mod tests {
 
     #[test]
     fn test_classify_error_for_metrics_validation() {
-        // 400 with "Validation:" prefix to validation
-        let error_type =
-            classify_error_for_metrics(StatusCode::BAD_REQUEST, "Validation: Invalid parameter");
-        assert_eq!(error_type, ErrorType::Validation);
+        // Validation errors do not consistently carry a "Validation:" prefix.
+        // Context-length rejects use this unprefixed message in production.
+        assert_eq!(
+            classify_error_for_metrics(StatusCode::BAD_REQUEST),
+            ErrorType::Validation
+        );
 
-        // 400 WITHOUT "Validation:" to internal (fallback)
-        let error_type = classify_error_for_metrics(StatusCode::BAD_REQUEST, "Some other error");
-        assert_eq!(error_type, ErrorType::Internal);
+        let response = ErrorMessage::from_http_error(HttpError {
+            code: 400,
+            message: "This model's maximum context length is 256000 tokens. Please reduce the length of the messages."
+                .to_string(),
+        });
+        assert_eq!(
+            extract_error_type_from_response(&response),
+            ErrorType::Validation
+        );
     }
 
     #[test]
     fn test_classify_error_for_metrics_status_codes() {
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_FOUND, "Model not found"),
+            classify_error_for_metrics(StatusCode::NOT_FOUND),
             ErrorType::NotFound
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED, "Feature not supported"),
+            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED),
             ErrorType::NotImplemented
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
+            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE, "Unavailable"),
+            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE),
             ErrorType::Unavailable
         );
         assert_eq!(
-            classify_error_for_metrics(overload_status_code(), "Overloaded"),
+            classify_error_for_metrics(overload_status_code()),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR, "Panic"),
+            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR),
             ErrorType::Internal
         );
     }
@@ -5913,11 +5936,11 @@ mod tests {
     fn test_classify_error_for_metrics_client_errors() {
         // Other 4xx errors should be classified as validation
         assert_eq!(
-            classify_error_for_metrics(StatusCode::UNAUTHORIZED, "Unauthorized"),
+            classify_error_for_metrics(StatusCode::UNAUTHORIZED),
             ErrorType::Validation
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::FORBIDDEN, "Forbidden"),
+            classify_error_for_metrics(StatusCode::FORBIDDEN),
             ErrorType::Validation
         );
     }
