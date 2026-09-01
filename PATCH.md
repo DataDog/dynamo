@@ -67,6 +67,13 @@ based on upstream `release/1.4.1`. Replayed from the `v1.4.0` branch.
 | `ec9b63d058` | Potential fix for pull request finding |
 | `b64f7ba837` | fix(runtime): reload TLS identities from content |
 
+## Multimodal Client Error Classification
+
+| Commit | Purpose |
+|--------|---------|
+| `b6af194ac` | Return HTTP 400 with base64 guidance when an external image URL cannot be reached |
+| `693831155` | Tag all HTTP 400 responses, including context-length rejects, as validation errors |
+
 ## Notes
 
 - 40 commits cherry-picked from `v1.4.0` branch onto `upstream/release/1.4.1`.
