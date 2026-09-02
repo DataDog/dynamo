@@ -72,7 +72,8 @@ based on upstream `release/1.4.1`. Replayed from the `v1.4.0` branch.
 | Commit | Purpose |
 |--------|---------|
 | `b6af194ac` | Return HTTP 400 with base64 guidance when an external image URL cannot be reached |
-| `693831155` | Tag all HTTP 400 responses, including context-length rejects, as validation errors |
+| `693831155` | Add validation tagging for HTTP 400 responses, including context-length rejects |
+| `f24e300f6` | Limit 400 validation tagging to recognized client errors; preserve unknown 400s as internal |
 
 ## Notes
 
