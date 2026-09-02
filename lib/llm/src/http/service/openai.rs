@@ -37,7 +37,7 @@ use super::{
     error::{HttpError, invalid_argument},
     metadata::{attach_x_request_id, extract_metadata_from_http},
     metrics::{
-        CancellationLabels, Endpoint, ErrorType, EventConverter,
+        CancellationLabels, Endpoint, ErrorType, EventConverter, find_invalid_argument_in_chain,
         process_chat_response_and_observe_metrics,
         process_chat_response_using_event_converter_and_observe_metrics,
         process_response_and_observe_metrics,
@@ -174,6 +174,32 @@ fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
     classify_error_for_metrics(response.0, &response.1.message)
 }
 
+/// Build the client response *and* the metrics classification from one error.
+///
+/// `from_anyhow` maps a typed `InvalidArgument` to HTTP 400 and then drops the
+/// type, leaving `classify_error_for_metrics` to re-derive it by sniffing the
+/// message for a `Validation:` prefix. Errors raised deeper in the stack (the
+/// preprocessor's `invalid_argument_error`, `validate_token_count`, or a
+/// worker-side Python `ValueError`) carry no such prefix, so they fell through
+/// to `Internal` and paged as server errors despite returning 400 on the wire.
+///
+/// Reading the chain before it is erased fixes that at the source. The
+/// heuristic stays as the fallback, so an untyped 400 is still conservatively
+/// counted as `Internal`.
+fn error_response_with_error_type(err: anyhow::Error, alt_msg: &str) -> (ErrorResponse, ErrorType) {
+    let is_invalid_argument = find_invalid_argument_in_chain(err.as_ref()).is_some();
+    let response = ErrorMessage::from_anyhow(err, alt_msg);
+    // Gate on the status too: `from_anyhow` checks rejection and unavailability
+    // before invalid-argument, so a chain carrying both must keep the 429/503
+    // classification that produced its status code.
+    let error_type = if is_invalid_argument && response.0 == StatusCode::BAD_REQUEST {
+        ErrorType::Validation
+    } else {
+        extract_error_type_from_response(&response)
+    };
+    (response, error_type)
+}
+
 fn responses_conversion_error_type(error: &anyhow::Error) -> ErrorType {
     match error.downcast_ref::<ResponsesConversionError>() {
         Some(ResponsesConversionError::InvalidArgument(_)) => ErrorType::Validation,
@@ -195,28 +221,6 @@ fn responses_conversion_error_response(error: anyhow::Error) -> ErrorResponse {
         }
         None => ErrorMessage::from_anyhow(error, CONTEXT),
     }
-}
-
-/// Match `InvalidArgument` at top-level OR under `Backend()`.
-/// `py_err_to_dynamo` wraps Python `ValueError`/`TypeError` as
-/// `Backend(InvalidArgument)`; both variants are 400-worthy.
-fn find_invalid_argument_in_chain<'a>(
-    err: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a dynamo_runtime::error::DynamoError> {
-    use dynamo_runtime::error::{BackendError, ErrorType};
-    let mut current = Some(err);
-    while let Some(e) = current {
-        if let Some(dynamo_err) = e.downcast_ref::<dynamo_runtime::error::DynamoError>()
-            && matches!(
-                dynamo_err.error_type(),
-                ErrorType::InvalidArgument | ErrorType::Backend(BackendError::InvalidArgument)
-            )
-        {
-            return Some(dynamo_err);
-        }
-        current = e.source();
-    }
-    None
 }
 
 fn find_queue_rejection_in_chain<'a>(
@@ -821,8 +825,9 @@ async fn completions_single(
                 .metrics_clone()
                 .inc_rejection(&model, super::metrics::Endpoint::Completions);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate completions");
+        inflight_guard.mark_error(error_type);
         err_response
     })?;
 
@@ -1077,8 +1082,9 @@ async fn completions_batch(
                     .metrics_clone()
                     .inc_rejection(&model, super::metrics::Endpoint::Completions);
             }
-            let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-            inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+            let (err_response, error_type) =
+                error_response_with_error_type(e, "Failed to generate completions");
+            inflight_guard.mark_error(error_type);
             err_response
         })?;
 
@@ -1285,8 +1291,9 @@ async fn embeddings(
                 .metrics_clone()
                 .inc_rejection(&model_name, super::metrics::Endpoint::Embeddings);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate embeddings");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate embeddings");
+        inflight.mark_error(error_type);
         err_response
     })?;
 
@@ -1447,8 +1454,9 @@ async fn classify(
                 .metrics_clone()
                 .inc_rejection(&model_name, super::metrics::Endpoint::Classify);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate classification");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate classification");
+        inflight.mark_error(error_type);
         err_response
     })?;
 
@@ -1466,11 +1474,11 @@ async fn classify(
     let response = NvCreateClassifyResponse::from_annotated_stream(stream)
         .await
         .map_err(|e| {
-            let err_response = ErrorMessage::from_anyhow(
+            let (err_response, error_type) = error_response_with_error_type(
                 anyhow::Error::new(e),
                 "Failed to fold classification stream",
             );
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            inflight.mark_error(error_type);
             err_response
         })?;
 
@@ -1727,8 +1735,9 @@ async fn pooling(
                 .metrics_clone()
                 .inc_rejection(&model_name, super::metrics::Endpoint::Pooling);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate pooling output");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate pooling output");
+        inflight.mark_error(error_type);
         err_response
     })?;
 
@@ -1746,9 +1755,11 @@ async fn pooling(
     let response = NvCreatePoolingResponse::from_annotated_stream(stream)
         .await
         .map_err(|e| {
-            let err_response =
-                ErrorMessage::from_anyhow(anyhow::Error::new(e), "Failed to fold pooling stream");
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            let (err_response, error_type) = error_response_with_error_type(
+                anyhow::Error::new(e),
+                "Failed to fold pooling stream",
+            );
+            inflight.mark_error(error_type);
             err_response
         })?;
 
@@ -1764,9 +1775,9 @@ async fn pooling(
                 response_endianness,
             )
             .map_err(|e| {
-                let err_response =
-                    ErrorMessage::from_anyhow(e, "Failed to build pooling binary response");
-                inflight.mark_error(extract_error_type_from_response(&err_response));
+                let (err_response, error_type) =
+                    error_response_with_error_type(e, "Failed to build pooling binary response");
+                inflight.mark_error(error_type);
                 err_response
             })?
         }
@@ -2473,8 +2484,9 @@ async fn chat_completions(
                 .metrics_clone()
                 .inc_rejection(&model, super::metrics::Endpoint::ChatCompletions);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate completions");
+        inflight_guard.mark_error(error_type);
         err_response
     })?;
 
@@ -2992,8 +3004,9 @@ async fn responses(
                 .metrics_clone()
                 .inc_rejection(&model, super::metrics::Endpoint::Responses);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate completions");
-        inflight_guard.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate completions");
+        inflight_guard.mark_error(error_type);
         err_response
     })?;
 
@@ -3689,8 +3702,9 @@ async fn images(
                 .metrics_clone()
                 .inc_rejection(&model, super::metrics::Endpoint::Images);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate images");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate images");
+        inflight.mark_error(error_type);
         err_response
     })?;
 
@@ -3806,8 +3820,9 @@ async fn videos(
                 .metrics_clone()
                 .inc_rejection(&model, super::metrics::Endpoint::Videos);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate videos");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate videos");
+        inflight.mark_error(error_type);
         err_response
     })?;
 
@@ -3916,8 +3931,9 @@ async fn video_stream(
                 .metrics_clone()
                 .inc_rejection(&model, super::metrics::Endpoint::Videos);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to start video stream");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to start video stream");
+        inflight.mark_error(error_type);
         err_response
     })?;
 
@@ -4106,8 +4122,9 @@ async fn audio_speech(
                 .metrics_clone()
                 .inc_rejection(&model, super::metrics::Endpoint::Audios);
         }
-        let err_response = ErrorMessage::from_anyhow(e, "Failed to generate audio");
-        inflight.mark_error(extract_error_type_from_response(&err_response));
+        let (err_response, error_type) =
+            error_response_with_error_type(e, "Failed to generate audio");
+        inflight.mark_error(error_type);
         err_response
     })?;
 
@@ -4123,9 +4140,11 @@ async fn audio_speech(
     let response = NvAudioSpeechResponse::from_annotated_stream(stream)
         .await
         .map_err(|e| {
-            let err_response =
-                ErrorMessage::from_anyhow(anyhow::Error::new(e), "Failed to fold audio stream");
-            inflight.mark_error(extract_error_type_from_response(&err_response));
+            let (err_response, error_type) = error_response_with_error_type(
+                anyhow::Error::new(e),
+                "Failed to fold audio stream",
+            );
+            inflight.mark_error(error_type);
             err_response
         })?;
 
@@ -5967,6 +5986,81 @@ mod tests {
             classify_error_for_metrics(StatusCode::FORBIDDEN, "Forbidden"),
             ErrorType::Validation
         );
+    }
+
+    #[test]
+    fn typed_invalid_argument_400_is_validation_without_a_message_prefix() {
+        use dynamo_runtime::error::{DynamoError, ErrorType as DynamoErrorType};
+        // Regression: `preprocessor::invalid_argument_error` and
+        // `validate_token_count` raise a typed `InvalidArgument` whose message
+        // carries no `Validation:` prefix. Classifying from the message alone
+        // counted these as `internal`, so a client sending a bad request paged
+        // the on-call with a 5xx alert while receiving a 400.
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(DynamoErrorType::InvalidArgument)
+            .message("mm_data must be a list")
+            .build()
+            .into();
+
+        let (response, error_type) = error_response_with_error_type(err, "Failed to generate");
+
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error_type, ErrorType::Validation);
+        // The client-facing message is untouched — no prefix is injected.
+        assert_eq!(response.1.message, "mm_data must be a list");
+    }
+
+    #[test]
+    fn backend_invalid_argument_400_is_validation() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
+        // `py_err_to_dynamo` maps a worker-side Python `ValueError`/`TypeError`
+        // to `Backend(InvalidArgument)`; it is just as much a client error.
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(DynamoErrorType::Backend(BackendError::InvalidArgument))
+            .message("min_tokens must be less than or equal to max_tokens=2, got 12.")
+            .build()
+            .into();
+
+        let (response, error_type) = error_response_with_error_type(err, "Failed to generate");
+
+        assert_eq!(response.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error_type, ErrorType::Validation);
+    }
+
+    #[test]
+    fn untyped_400_still_falls_back_to_internal() {
+        // The conservative fallback is deliberate and must survive: a server
+        // bug incorrectly surfaced as 400 has to stay actionable. Only a
+        // positively typed `InvalidArgument` earns the `Validation` label.
+        let err = anyhow::anyhow!("some opaque failure");
+
+        let (_response, error_type) = error_response_with_error_type(err, "Failed to generate");
+
+        assert_eq!(error_type, ErrorType::Internal);
+    }
+
+    #[test]
+    fn unavailable_outranks_a_nested_invalid_argument() {
+        use dynamo_runtime::error::{DynamoError, ErrorType as DynamoErrorType};
+        // `from_anyhow` triages unavailability before invalid-argument, so a
+        // chain carrying both must keep the 503 classification that produced
+        // its status code rather than being relabelled a client error.
+        let err: anyhow::Error = DynamoError::builder()
+            .error_type(DynamoErrorType::Unavailable)
+            .message("no worker available")
+            .cause(
+                DynamoError::builder()
+                    .error_type(DynamoErrorType::InvalidArgument)
+                    .message("inner detail")
+                    .build(),
+            )
+            .build()
+            .into();
+
+        let (response, error_type) = error_response_with_error_type(err, "Failed to generate");
+
+        assert_eq!(response.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_type, ErrorType::Unavailable);
     }
 
     #[test]

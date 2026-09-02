@@ -31,7 +31,7 @@ use crate::protocols::{
 };
 use dynamo_runtime::metrics::prometheus_names::clamp_u64_to_i64;
 
-use dynamo_runtime::error::ErrorType as DynamoErrorType;
+use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
 
 /// Check whether an error chain indicates the request was rejected.
 pub fn request_was_rejected(err: &(dyn std::error::Error + 'static)) -> bool {
@@ -52,6 +52,35 @@ pub fn request_was_cancelled(err: &(dyn std::error::Error + 'static)) -> bool {
     const CANCELLATION: &[DynamoErrorType] = &[DynamoErrorType::Cancelled];
     const NON_CANCELLATION: &[DynamoErrorType] = &[];
     dynamo_runtime::error::match_error_chain(err, CANCELLATION, NON_CANCELLATION)
+}
+
+/// Find an invalid-argument error anywhere in the chain.
+///
+/// Matches both the top-level `InvalidArgument` and `Backend(InvalidArgument)`
+/// — the latter is what `py_err_to_dynamo` produces for a Python `ValueError`
+/// or `TypeError`. Both mean the request itself was malformed, so both are
+/// client errors, and both survive the `Annotated` stream from worker to
+/// frontend.
+///
+/// Returns the error rather than a bool (unlike its `request_was_*` siblings)
+/// because callers need its message for the client-facing 400 body.
+pub fn find_invalid_argument_in_chain<'a>(
+    err: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a DynamoError> {
+    let mut current = Some(err);
+    while let Some(e) = current {
+        if let Some(dynamo_err) = e.downcast_ref::<DynamoError>()
+            && matches!(
+                dynamo_err.error_type(),
+                DynamoErrorType::InvalidArgument
+                    | DynamoErrorType::Backend(BackendError::InvalidArgument)
+            )
+        {
+            return Some(dynamo_err);
+        }
+        current = e.source();
+    }
+    None
 }
 
 pub use prometheus::Registry;
@@ -2050,11 +2079,18 @@ fn annotated_to_sse_event<T: Serialize>(
 
     if let Some(ref msg) = annotated.event {
         if msg == "error" {
-            let error_message = if let Some(ref dynamo_err) = annotated.error
+            // Propagate the `DynamoError` itself, not just its text. The worker
+            // already classified the failure (e.g. `Backend(InvalidArgument)`
+            // for a Python `ValueError`) and that type is serialized across the
+            // `Annotated` stream; flattening it to a `String` here erased it,
+            // leaving `monitor_for_disconnects` no choice but to record every
+            // mid-stream failure as `internal`.
+            if let Some(ref dynamo_err) = annotated.error
                 && !dynamo_err.message().is_empty()
             {
-                dynamo_err.message().to_string()
-            } else if let Some(ref comments) = annotated.comment {
+                return Err(axum::Error::new(dynamo_err.clone()));
+            }
+            let error_message = if let Some(ref comments) = annotated.comment {
                 let joined = comments.join(" -- ");
                 if joined.trim().is_empty() {
                     "unspecified error".to_string()

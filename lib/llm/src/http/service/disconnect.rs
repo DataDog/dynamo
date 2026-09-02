@@ -28,6 +28,7 @@
 //! done by sending a [`axum::response::sse::Event`] with the event type "error" and the data "[DONE]".
 //!
 
+use axum::http::StatusCode;
 use axum::response::sse::Event;
 use dynamo_runtime::engine::AsyncEngineContext;
 use futures::{Stream, StreamExt};
@@ -35,7 +36,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::http::service::error::SanitizedError;
-use crate::http::service::metrics::{CancellationLabels, ErrorType, InflightGuard, Metrics};
+use crate::http::service::metrics::{
+    CancellationLabels, ErrorType, InflightGuard, Metrics, find_invalid_argument_in_chain,
+};
 
 use dynamo_runtime::config::environment_names::llm::DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS as BACKEND_STREAM_TIMEOUT_ENV;
 
@@ -236,8 +239,46 @@ fn monitor_for_disconnects_with_timeout(
                             yield event;
                         }
                         Some(Err(err)) => {
-                            // Mark error as internal since it's a streaming error
-                            inflight_guard.mark_error(ErrorType::Internal);
+                            // A mid-stream failure is not automatically a server
+                            // fault. The 200 header is already on the wire, but the
+                            // cause may still be the client's own request — a bad
+                            // sampling parameter surfaces as a worker-side Python
+                            // `ValueError`, which arrives here typed as
+                            // `Backend(InvalidArgument)`. Classify from the chain so
+                            // those are counted as validation errors instead of
+                            // paging as 5xx.
+                            let (error_type, err_json) =
+                                match find_invalid_argument_in_chain(&err) {
+                                    Some(dynamo_err) => (
+                                        ErrorType::Validation,
+                                        // Forwarding the backend message verbatim
+                                        // matches the non-streaming contract in
+                                        // `ErrorMessage::from_http_error`: 4xx bodies
+                                        // are the client's own diagnostics, and only
+                                        // 5xx bodies get sanitized.
+                                        serde_json::json!({
+                                            "error": {
+                                                "message": dynamo_err.message(),
+                                                "type": "invalid_request_error",
+                                                "code": StatusCode::BAD_REQUEST.as_u16(),
+                                            }
+                                        }),
+                                    ),
+                                    None => {
+                                        let sanitized = SanitizedError::Internal;
+                                        (
+                                            ErrorType::Internal,
+                                            serde_json::json!({
+                                                "error": {
+                                                    "message": sanitized.to_string(),
+                                                    "type": sanitized.openai_type_slug(),
+                                                    "code": sanitized.status().as_u16(),
+                                                }
+                                            }),
+                                        )
+                                    }
+                                };
+                            inflight_guard.mark_error(error_type);
                             // We're terminating the stream intentionally here with a
                             // structured error + [DONE]; disarm so the stream handle
                             // doesn't later record this as ClosedUnexpectedly (which
@@ -246,16 +287,7 @@ fn monitor_for_disconnects_with_timeout(
                             tracing::error!("Streaming error: {err}");
                             // Emit a structured OpenAI-style error frame + `data: [DONE]`
                             // so naive `data:`-line parsers see both the error and a
-                            // stream terminator. Body derived from SanitizedError so
-                            // the sanitized message + status live in one place.
-                            let sanitized = SanitizedError::Internal;
-                            let err_json = serde_json::json!({
-                                "error": {
-                                    "message": sanitized.to_string(),
-                                    "type": sanitized.openai_type_slug(),
-                                    "code": sanitized.status().as_u16(),
-                                }
-                            });
+                            // stream terminator.
                             yield Event::default().data(err_json.to_string());
                             yield Event::default().data("[DONE]");
                             // Break to prevent any subsequent mark_ok() from overwriting the error
@@ -774,5 +806,93 @@ mod tests {
         assert!(!body.contains("site-packages"), "leaked a filesystem path");
         assert!(!body.contains("panicked at"), "leaked panic text");
         assert!(!body.contains("ValueError"), "leaked exception type");
+    }
+
+    /// A worker-side Python `ValueError` arrives here typed as
+    /// `Backend(InvalidArgument)`. It is the client's own bad request, so it must
+    /// be counted as `validation` — not `internal`, which pages — even though the
+    /// 200 header is already on the wire. Its message is forwarded verbatim, the
+    /// same contract non-streaming 400s follow.
+    #[tokio::test]
+    async fn test_mid_stream_invalid_argument_is_validation_not_internal() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
+
+        let model = "mid-stream-invalid-arg";
+        let (metrics, guard, ctx, handle) = setup_test(model, "req-invalid-arg");
+        // The real qwen failure text observed in staging.
+        let detail = "min_tokens must be less than or equal to max_tokens=2, got 12.";
+        let dynamo_err = DynamoError::builder()
+            .error_type(DynamoErrorType::Backend(BackendError::InvalidArgument))
+            .message(detail)
+            .build();
+        let stream = async_stream::try_stream! {
+            yield Event::default().data("chunk-0");
+            Err(axum::Error::new(dynamo_err))?;
+        };
+
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+
+        assert_eq!(
+            metrics.get_request_counter(
+                model,
+                &Endpoint::ChatCompletions,
+                &RequestType::Stream,
+                &Status::Error,
+                &ErrorType::Validation,
+            ),
+            1,
+            "a typed Backend(InvalidArgument) must be recorded as validation. Body:\n{body}"
+        );
+        assert_eq!(
+            metrics.get_request_counter(
+                model,
+                &Endpoint::ChatCompletions,
+                &RequestType::Stream,
+                &Status::Error,
+                &ErrorType::Internal,
+            ),
+            0,
+            "a client-caused mid-stream failure must not page as internal. Body:\n{body}"
+        );
+        assert!(
+            body.contains(detail),
+            "the 400-class backend message is the client's own diagnostic and must be \
+             forwarded verbatim. Body:\n{body}"
+        );
+        assert!(
+            body.contains("invalid_request_error"),
+            "structured frame must carry the OpenAI invalid_request_error type. Body:\n{body}"
+        );
+        assert!(
+            body.contains("data: [DONE]"),
+            "stream must still terminate cleanly. Body:\n{body}"
+        );
+    }
+
+    /// The converse guard: an untyped mid-stream failure keeps the conservative
+    /// `internal` classification and the sanitized body.
+    #[tokio::test]
+    async fn test_mid_stream_untyped_error_stays_internal() {
+        let model = "mid-stream-untyped";
+        let (metrics, guard, ctx, handle) = setup_test(model, "req-untyped");
+        let detail = "Disconnected: Stream ended before generation completed";
+        let stream = simulate_mid_stream_error(1, detail);
+
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+
+        assert_eq!(
+            metrics.get_request_counter(
+                model,
+                &Endpoint::ChatCompletions,
+                &RequestType::Stream,
+                &Status::Error,
+                &ErrorType::Internal,
+            ),
+            1,
+            "an unclassified mid-stream failure must remain internal. Body:\n{body}"
+        );
+        assert_fault_contract("untyped_stays_internal", &body, detail);
     }
 }
