@@ -142,9 +142,21 @@ fn map_error_code_to_error_type(code: StatusCode) -> String {
     }
 }
 
-/// Classify errors for metrics from the HTTP status returned to the client.
-fn classify_error_for_metrics(code: StatusCode) -> ErrorType {
+/// Classify error for metrics based on status code and message.
+fn classify_error_for_metrics(code: StatusCode, message: &str) -> ErrorType {
     match code {
+        StatusCode::BAD_REQUEST => {
+            if message.starts_with("Validation:")
+                || message == crate::preprocessor::EXTERNAL_IMAGE_URL_FETCH_ERROR
+                || message.starts_with("This model's maximum context length is ")
+            {
+                ErrorType::Validation
+            } else {
+                // Preserve the conservative fallback for unrecognized 400s: a
+                // server bug incorrectly surfaced as 400 must remain actionable.
+                ErrorType::Internal
+            }
+        }
         StatusCode::NOT_FOUND => ErrorType::NotFound, // 404
         StatusCode::NOT_IMPLEMENTED => ErrorType::NotImplemented, // 501
         StatusCode::TOO_MANY_REQUESTS => ErrorType::Overload, // 429
@@ -159,7 +171,7 @@ fn classify_error_for_metrics(code: StatusCode) -> ErrorType {
 
 /// Extract ErrorType from ErrorResponse for metrics
 fn extract_error_type_from_response(response: &ErrorResponse) -> ErrorType {
-    classify_error_for_metrics(response.0)
+    classify_error_for_metrics(response.0, &response.1.message)
 }
 
 fn responses_conversion_error_type(error: &anyhow::Error) -> ErrorType {
@@ -4826,7 +4838,8 @@ mod tests {
     #[test]
     fn test_cancelled_error_metrics_classification() {
         // HTTP 499 should be classified as Cancelled for metrics
-        let error_type = classify_error_for_metrics(StatusCode::from_u16(499).unwrap());
+        let error_type =
+            classify_error_for_metrics(StatusCode::from_u16(499).unwrap(), "cancelled request");
         assert_eq!(
             error_type,
             ErrorType::Cancelled,
@@ -5886,10 +5899,16 @@ mod tests {
 
     #[test]
     fn test_classify_error_for_metrics_validation() {
-        // Validation errors do not consistently carry a "Validation:" prefix.
-        // Context-length rejects use this unprefixed message in production.
         assert_eq!(
-            classify_error_for_metrics(StatusCode::BAD_REQUEST),
+            classify_error_for_metrics(StatusCode::BAD_REQUEST, "Validation: Invalid parameter"),
+            ErrorType::Validation
+        );
+
+        assert_eq!(
+            classify_error_for_metrics(
+                StatusCode::BAD_REQUEST,
+                crate::preprocessor::EXTERNAL_IMAGE_URL_FETCH_ERROR,
+            ),
             ErrorType::Validation
         );
 
@@ -5902,32 +5921,37 @@ mod tests {
             extract_error_type_from_response(&response),
             ErrorType::Validation
         );
+
+        assert_eq!(
+            classify_error_for_metrics(StatusCode::BAD_REQUEST, "Some other error"),
+            ErrorType::Internal
+        );
     }
 
     #[test]
     fn test_classify_error_for_metrics_status_codes() {
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_FOUND),
+            classify_error_for_metrics(StatusCode::NOT_FOUND, "Model not found"),
             ErrorType::NotFound
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED),
+            classify_error_for_metrics(StatusCode::NOT_IMPLEMENTED, "Feature not supported"),
             ErrorType::NotImplemented
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS),
+            classify_error_for_metrics(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE),
+            classify_error_for_metrics(StatusCode::SERVICE_UNAVAILABLE, "Unavailable"),
             ErrorType::Unavailable
         );
         assert_eq!(
-            classify_error_for_metrics(overload_status_code()),
+            classify_error_for_metrics(overload_status_code(), "Overloaded"),
             ErrorType::Overload
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR),
+            classify_error_for_metrics(StatusCode::INTERNAL_SERVER_ERROR, "Panic"),
             ErrorType::Internal
         );
     }
@@ -5936,11 +5960,11 @@ mod tests {
     fn test_classify_error_for_metrics_client_errors() {
         // Other 4xx errors should be classified as validation
         assert_eq!(
-            classify_error_for_metrics(StatusCode::UNAUTHORIZED),
+            classify_error_for_metrics(StatusCode::UNAUTHORIZED, "Unauthorized"),
             ErrorType::Validation
         );
         assert_eq!(
-            classify_error_for_metrics(StatusCode::FORBIDDEN),
+            classify_error_for_metrics(StatusCode::FORBIDDEN, "Forbidden"),
             ErrorType::Validation
         );
     }
