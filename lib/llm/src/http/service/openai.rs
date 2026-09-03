@@ -2000,10 +2000,10 @@ fn escape_json_string_control_chars(body: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Checks if an Annotated event represents a backend error and extracts error information.
-/// Returns Some((message, status_code)) if it's an error, None otherwise.
+/// Returns Some((message, status_code, is_typed_invalid_argument)) if it's an error, None otherwise.
 fn extract_backend_error_if_present<T: serde::Serialize>(
     event: &Annotated<T>,
-) -> Option<(String, StatusCode)> {
+) -> Option<(String, StatusCode, bool)> {
     #[derive(serde::Deserialize)]
     struct ErrorPayload {
         message: Option<String>,
@@ -2068,17 +2068,18 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
             let message = error_payload
                 .message
                 .unwrap_or_else(|| status_message.to_string());
-            return Some((message, code));
+            return Some((message, code, invalid_argument.is_some()));
         }
 
         if let Some(invalid_argument) = invalid_argument {
             return Some((
                 invalid_argument.message().to_string(),
                 StatusCode::BAD_REQUEST,
+                true,
             ));
         }
 
-        return Some((error_str, StatusCode::INTERNAL_SERVER_ERROR));
+        return Some((error_str, StatusCode::INTERNAL_SERVER_ERROR, false));
     }
 
     // Check if the data payload itself contains an error structure with code >= 400
@@ -2092,7 +2093,7 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
         let message = error_payload
             .message
             .unwrap_or_else(|| json_value.to_string());
-        return Some((message, code));
+        return Some((message, code, false));
     }
 
     // Check if comment contains error information (without event: error)
@@ -2108,13 +2109,13 @@ fn extract_backend_error_if_present<T: serde::Serialize>(
         {
             let code = StatusCode::from_u16(code_num).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let message = error_payload.message.unwrap_or(comment_str);
-            return Some((message, code));
+            return Some((message, code, false));
         }
 
         // Comments present with no data AND no event type indicates error
         // (events with event types like "request_id" or "event.dynamo.test.sentinel" are annotations)
         if event.data.is_none() && event.event.is_none() {
-            return Some((comment_str, StatusCode::INTERNAL_SERVER_ERROR));
+            return Some((comment_str, StatusCode::INTERNAL_SERVER_ERROR, false));
         }
     }
 
@@ -2148,14 +2149,14 @@ const MAX_LEADING_ANNOTATIONS: usize = 16;
 /// Returns Err(ErrorResponse) if error detected, Ok(stream) otherwise — the
 /// returned stream replays any buffered annotation frames in their original
 /// order before yielding the remaining items.
-pub(super) async fn check_for_backend_error(
+async fn check_for_backend_error_with_error_type(
     mut stream: impl futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>
     + Send
     + Unpin
     + 'static,
 ) -> Result<
     impl futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send,
-    ErrorResponse,
+    (ErrorResponse, ErrorType),
 > {
     use futures::stream::StreamExt;
 
@@ -2165,8 +2166,10 @@ pub(super) async fn check_for_backend_error(
             buffered.push(event);
             continue;
         }
-        if let Some((error_msg, status_code)) = extract_backend_error_if_present(&event) {
-            return Err(match SanitizedError::for_backend_status(status_code) {
+        if let Some((error_msg, status_code, is_invalid_argument)) =
+            extract_backend_error_if_present(&event)
+        {
+            let error_response = match SanitizedError::for_backend_status(status_code) {
                 Some(variant) => ErrorMessage::sanitized_with_details(variant, error_msg),
                 // 4xx (non-499): protocol contract — forward backend message as-is.
                 None => (
@@ -2178,7 +2181,13 @@ pub(super) async fn check_for_backend_error(
                         details: None,
                     }),
                 ),
-            });
+            };
+            let error_type = if is_invalid_argument && status_code == StatusCode::BAD_REQUEST {
+                ErrorType::Validation
+            } else {
+                extract_error_type_from_response(&error_response)
+            };
+            return Err((error_response, error_type));
         }
 
         // First non-annotation, non-error event — push it back and stop;
@@ -2187,6 +2196,20 @@ pub(super) async fn check_for_backend_error(
         break;
     }
     Ok(futures::stream::iter(buffered).chain(stream))
+}
+
+pub(super) async fn check_for_backend_error(
+    stream: impl futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>>
+    + Send
+    + Unpin
+    + 'static,
+) -> Result<
+    impl futures::Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send,
+    ErrorResponse,
+> {
+    check_for_backend_error_with_error_type(stream)
+        .await
+        .map_err(|(error_response, _)| error_response)
 }
 
 #[derive(Serialize)]
@@ -2602,14 +2625,13 @@ async fn chat_completions(
         Ok(sse_stream.into_response())
     } else {
         // Check first event for backend errors before aggregating (non-streaming only)
-        let stream_with_check =
-            check_for_backend_error(stream)
-                .await
-                .map_err(|error_response| {
-                    tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                    inflight_guard.mark_error(extract_error_type_from_response(&error_response));
-                    error_response
-                })?;
+        let stream_with_check = check_for_backend_error_with_error_type(stream)
+            .await
+            .map_err(|(error_response, error_type)| {
+                tracing::error!(request_id, "Backend error detected: {:?}", error_response);
+                inflight_guard.mark_error(error_type);
+                error_response
+            })?;
 
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream_with_check.inspect(move |response| {
@@ -3088,14 +3110,13 @@ async fn responses(
         // Non-streaming path: aggregate stream into single response
 
         // Check first event for backend errors before aggregating (non-streaming only)
-        let stream_with_check =
-            check_for_backend_error(engine_stream)
-                .await
-                .map_err(|error_response| {
-                    tracing::error!(request_id, "Backend error detected: {:?}", error_response);
-                    inflight_guard.mark_error(extract_error_type_from_response(&error_response));
-                    error_response
-                })?;
+        let stream_with_check = check_for_backend_error_with_error_type(engine_stream)
+            .await
+            .map_err(|(error_response, error_type)| {
+                tracing::error!(request_id, "Backend error detected: {:?}", error_response);
+                inflight_guard.mark_error(error_type);
+                error_response
+            })?;
 
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream_with_check.inspect(move |response| {
@@ -5589,12 +5610,12 @@ mod tests {
     #[tokio::test]
     async fn test_check_for_backend_error_with_typed_invalid_argument() {
         use crate::types::openai::chat_completions::NvCreateChatCompletionStreamResponse;
-        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType};
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
         use futures::stream;
 
         for error_type in [
-            ErrorType::InvalidArgument,
-            ErrorType::Backend(BackendError::InvalidArgument),
+            DynamoErrorType::InvalidArgument,
+            DynamoErrorType::Backend(BackendError::InvalidArgument),
         ] {
             let error_event = Annotated::<NvCreateChatCompletionStreamResponse> {
                 data: None,
@@ -5609,17 +5630,38 @@ mod tests {
                 ),
             };
 
-            let result = check_for_backend_error(stream::iter(vec![error_event])).await;
+            let result =
+                check_for_backend_error_with_error_type(stream::iter(vec![error_event])).await;
 
-            let error_response = match result {
-                Err(error_response) => error_response,
+            let (error_response, metric_error_type) = match result {
+                Err(error) => error,
                 Ok(_) => panic!("typed invalid argument must fail"),
             };
             assert_eq!(error_response.0, StatusCode::BAD_REQUEST);
             assert_eq!(error_response.1.code, StatusCode::BAD_REQUEST.as_u16());
             assert_eq!(error_response.1.error_type, "Bad Request");
             assert_eq!(error_response.1.message, "unsupported JSON schema keyword");
+            assert_eq!(metric_error_type, super::ErrorType::Validation);
         }
+
+        let untyped_error = Annotated::<NvCreateChatCompletionStreamResponse> {
+            data: None,
+            id: None,
+            event: Some("error".to_string()),
+            comment: Some(vec![
+                r#"{"message":"opaque failure","code":400}"#.to_string(),
+            ]),
+            error: None,
+        };
+        let metric_error_type = match check_for_backend_error_with_error_type(stream::iter(vec![
+            untyped_error,
+        ]))
+        .await
+        {
+            Err((_, error_type)) => error_type,
+            Ok(_) => panic!("untyped backend 400 must fail"),
+        };
+        assert_eq!(metric_error_type, super::ErrorType::Internal);
     }
 
     #[tokio::test]
