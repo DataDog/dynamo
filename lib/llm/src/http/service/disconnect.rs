@@ -196,6 +196,17 @@ async fn connection_monitor(
 /// SSE event is received from the backend within the timeout window, the engine context is killed and
 /// the inflight guard is dropped, preventing permanent gauge inflation caused by zombie workers that
 /// hold a live TCP connection but produce no output.
+/// Static client-facing message for a mid-stream request validation failure.
+///
+/// A typed `Backend(InvalidArgument)` only says *how the error was classified*
+/// — `py_err_to_dynamo` maps any Python `ValueError`/`TypeError` escaping the
+/// engine, including engine bugs, into this type. Their text can carry filesystem
+/// paths, tensor shapes, or config details, so the mid-stream SSE frame ships a
+/// static message; the real detail stays server-side (see the `tracing::warn!`
+/// in `monitor_for_disconnects_with_timeout`).
+const MID_STREAM_VALIDATION_MESSAGE: &str =
+    "Invalid request: the request was rejected during generation. Please check the request parameters.";
+
 pub fn monitor_for_disconnects(
     stream: impl Stream<Item = Result<Event, axum::Error>>,
     context: Arc<dyn AsyncEngineContext>,
@@ -249,16 +260,21 @@ fn monitor_for_disconnects_with_timeout(
                             // paging as 5xx.
                             let (error_type, err_json) =
                                 match find_invalid_argument_in_chain(&err) {
-                                    Some(dynamo_err) => (
+                                    // The typed error's text is NOT forwarded:
+                                    // `Backend(InvalidArgument)` is a
+                                    // classification marker, not a content
+                                    // trust marker. `py_err_to_dynamo` maps *any*
+                                    // Python `ValueError`/`TypeError` escaping the
+                                    // engine — including engine bugs — whose text
+                                    // can carry filesystem paths, tensor shapes, or
+                                    // config details. The client gets a static
+                                    // message; the real detail stays server-side
+                                    // in the `tracing::error!` below.
+                                    Some(_) => (
                                         ErrorType::Validation,
-                                        // Forwarding the backend message verbatim
-                                        // matches the non-streaming contract in
-                                        // `ErrorMessage::from_http_error`: 4xx bodies
-                                        // are the client's own diagnostics, and only
-                                        // 5xx bodies get sanitized.
                                         serde_json::json!({
                                             "error": {
-                                                "message": dynamo_err.message(),
+                                                "message": MID_STREAM_VALIDATION_MESSAGE,
                                                 "type": "invalid_request_error",
                                                 "code": StatusCode::BAD_REQUEST.as_u16(),
                                             }
@@ -811,8 +827,9 @@ mod tests {
     /// A worker-side Python `ValueError` arrives here typed as
     /// `Backend(InvalidArgument)`. It is the client's own bad request, so it must
     /// be counted as `validation` — not `internal`, which pages — even though the
-    /// 200 header is already on the wire. Its message is forwarded verbatim, the
-    /// same contract non-streaming 400s follow.
+    /// 200 header is already on the wire. The client-facing frame carries a static
+    /// message: the type is a classification marker, not a content trust marker,
+    /// so the backend detail stays server-side (info-disclosure guard).
     #[tokio::test]
     async fn test_mid_stream_invalid_argument_is_validation_not_internal() {
         use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
@@ -856,9 +873,13 @@ mod tests {
             "a client-caused mid-stream failure must not page as internal. Body:\n{body}"
         );
         assert!(
-            body.contains(detail),
-            "the 400-class backend message is the client's own diagnostic and must be \
-             forwarded verbatim. Body:\n{body}"
+            !body.contains(detail),
+            "mid-stream backend detail must stay server-side, not ship in the SSE frame. \
+             Body:\n{body}"
+        );
+        assert!(
+            body.contains(MID_STREAM_VALIDATION_MESSAGE),
+            "client must get the static validation message. Body:\n{body}"
         );
         assert!(
             body.contains("invalid_request_error"),
@@ -867,6 +888,46 @@ mod tests {
         assert!(
             body.contains("data: [DONE]"),
             "stream must still terminate cleanly. Body:\n{body}"
+        );
+    }
+
+    /// Regression (info-disclosure): `py_err_to_dynamo` maps *any* Python
+    /// `ValueError`/`TypeError` escaping the engine — including engine bugs —
+    /// to `Backend(InvalidArgument)`. The typed classification must not upgrade
+    /// the raw text to client-visible; a mid-stream frame carrying paths,
+    /// tensor shapes, or stack details would leak server internals.
+    #[tokio::test]
+    async fn test_mid_stream_invalid_argument_does_not_leak_internals() {
+        use dynamo_runtime::error::{BackendError, DynamoError, ErrorType as DynamoErrorType};
+
+        let model = "mid-stream-invalid-arg-leak";
+        let (_metrics, guard, ctx, handle) = setup_test(model, "req-invalid-arg-leak");
+        // Sensitive-looking text typed as a client error by the worker.
+        let detail = "ValueError: could not load /opt/dynamo/models/qwen-2.5/config.json \
+for tensor shape (32, 128, 8192)";
+        let dynamo_err = DynamoError::builder()
+            .error_type(DynamoErrorType::Backend(BackendError::InvalidArgument))
+            .message(detail)
+            .build();
+        let stream = async_stream::try_stream! {
+            yield Event::default().data("chunk-0");
+            Err(axum::Error::new(dynamo_err))?;
+        };
+
+        let monitored = monitor_for_disconnects_with_timeout(stream, ctx, guard, handle, None);
+        let body = collect_sse_body(monitored).await;
+
+        assert!(
+            !body.contains(detail),
+            "typed Backend(InvalidArgument) detail must not ship in the SSE frame. Body:\n{body}"
+        );
+        // Spot-check the most damaging fragments explicitly.
+        assert!(!body.contains("/opt/dynamo"), "leaked a filesystem path");
+        assert!(!body.contains("ValueError"), "leaked exception type");
+        assert!(!body.contains("(32, 128, 8192)"), "leaked tensor shape");
+        assert!(
+            body.contains(MID_STREAM_VALIDATION_MESSAGE),
+            "client must get the static validation message instead. Body:\n{body}"
         );
     }
 

@@ -76,6 +76,7 @@ based on upstream `release/1.4.1`. Replayed from the `v1.4.0` branch.
 | `f24e300f6` | Limit 400 validation tagging to recognized client errors; preserve unknown 400s as internal |
 | `e7b1a17db` | Classify request errors from the typed `ErrorType` in the error chain instead of the message text, on both the request and streaming paths |
 | `e5956fb07` | Preserve typed backend errors through unary chat and Responses API stream checks |
+| _(this commit)_ | Keep the mid-stream SSE error frame static: typed `Backend(InvalidArgument)` classifies as `validation` for metrics, but its backend text stays server-side (info-disclosure guard) |
 
 ## Notes
 
